@@ -17389,6 +17389,10 @@ static bool read_http_request(int fd, http_request *r) {
                             goto fail;
                         }
                         buf_append(&b, tmp, (size_t)n);
+                        if (b.len - (size_t)hend > max_body) {
+                            buf_free(&decoded);
+                            goto fail;
+                        }
                         while (trailer_end < b.len && b.ptr[trailer_end] != '\n') {
                             trailer_end++;
                         }
@@ -17447,6 +17451,15 @@ static bool read_http_request(int fd, http_request *r) {
                     buf_free(&decoded);
                     goto fail;
                 }
+            }
+
+            if (term_len == 2 && b.ptr[src_pos + (size_t)val + 1] != '\n') {
+                buf_free(&decoded);
+                goto fail;
+            }
+            if (term_len == 1 && b.ptr[src_pos + (size_t)val] != '\n') {
+                buf_free(&decoded);
+                goto fail;
             }
 
             /* Append the val bytes of chunk data to decoded */
