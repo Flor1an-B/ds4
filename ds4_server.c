@@ -10672,7 +10672,6 @@ static bool should_remember_tool_context_checkpoint(const request *r,
                                                     const thinking_state *thinking,
                                                     const char *finish) {
     if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES) return false;
-    if (!r->prompt_preserves_reasoning) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -10919,6 +10918,73 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * disk-restore round trip on every agent turn.  calls is NULL and tool_turn
  * is false for the no-tool-call case; both are non-NULL/true for a
  * completed tool call. */
+
+/* OpenClaw injects a current-turn runtime-context carrier as a trailing user
+ * message. OpenClaw intentionally removes that carrier on the next replay.
+ * Build the future replay base by dropping only that final internal carrier. */
+static bool build_openclaw_replay_checkpoint_base(const request *r, buf *out) {
+    if (!r || !out || !r->prompt_text || !r->prompt_text[0]) return false;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK) return false;
+
+    const char *prompt = r->prompt_text;
+    const char *user_tag = "<｜User｜>";
+    const char *assistant_tag = "<｜Assistant｜>";
+    const size_t user_tag_len = strlen(user_tag);
+
+    /* Locate the final user message in the rendered prompt.  OpenClaw places
+     * its current-turn runtime-context carrier there, immediately before the
+     * assistant generation prefix. */
+    const char *last_user = NULL;
+    const char *scan = prompt;
+    while ((scan = strstr(scan, user_tag)) != NULL) {
+        last_user = scan;
+        scan += user_tag_len;
+    }
+    if (!last_user) return false;
+
+    const char *assistant = strstr(last_user + user_tag_len, assistant_tag);
+    if (!assistant) return false;
+
+    /* The carrier must be the final user segment. */
+    if (strstr(assistant + strlen(assistant_tag), user_tag)) return false;
+
+    const char *legacy_header =
+        "OpenClaw runtime context for the immediately preceding user message.";
+    const char *active_header =
+        "OpenClaw runtime context for the active user request in this turn.";
+    const char *event_header = "OpenClaw runtime event.";
+    const char *begin_marker = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const char *end_marker = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+    const char *legacy = strstr(last_user + user_tag_len, legacy_header);
+    const char *active = strstr(last_user + user_tag_len, active_header);
+    const char *event = strstr(last_user + user_tag_len, event_header);
+    const char *begin = strstr(last_user + user_tag_len, begin_marker);
+    const char *finish = strstr(last_user + user_tag_len, end_marker);
+
+    const bool has_header =
+        (legacy && legacy < assistant) ||
+        (active && active < assistant) ||
+        (event && event < assistant);
+
+    /* Current OpenClaw uses the protected begin/end delimiters.  Accept the
+     * legacy header-only shape too, but when delimiters are present require a
+     * complete pair before the assistant prefix. */
+    const bool has_delimited_block =
+        begin && finish && begin < finish && finish < assistant;
+
+    if (!has_header && !has_delimited_block) return false;
+    if ((begin || finish) && !has_delimited_block) return false;
+
+    /* Future replay strips this transient <User> runtime-context carrier.
+     * Keep everything before it, then resume directly with the assistant role.
+     * build_tool_checkpoint_suffix() appends </think>, visible content, tool
+     * calls, and EOS in the exact historical-assistant form. */
+    buf_append(out, prompt, (size_t)(last_user - prompt));
+    buf_puts(out, assistant_tag);
+    return true;
+}
+
 static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
                                              const job *j, const char *ctx,
                                              uint64_t trace_id,
@@ -10930,9 +10996,13 @@ static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
         thinking_live_clear(s, slot);
         return;
     }
-    char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
     buf visible = {0};
-    buf_puts(&visible, j->req.prompt_text);
+    const bool openclaw_runtime_tail =
+        build_openclaw_replay_checkpoint_base(&j->req, &visible);
+    const char *checkpoint_reasoning = openclaw_runtime_tail ? NULL : reasoning;
+    char *suffix =
+        build_tool_checkpoint_suffix(&j->req, content, checkpoint_reasoning, calls);
+    if (!openclaw_runtime_tail) buf_puts(&visible, j->req.prompt_text);
     buf_puts(&visible, suffix ? suffix : "");
     thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", tool_turn);
     server_log(DS4_LOG_KVCACHE,
@@ -10956,10 +11026,14 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          const char *reasoning, const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
-    char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
-
     buf rendered = {0};
-    buf_puts(&rendered, j->req.prompt_text);
+    const bool openclaw_runtime_tail =
+        build_openclaw_replay_checkpoint_base(&j->req, &rendered);
+    const char *checkpoint_reasoning = openclaw_runtime_tail ? NULL : reasoning;
+    char *suffix_text =
+        build_tool_checkpoint_suffix(&j->req, content, checkpoint_reasoning, calls);
+
+    if (!openclaw_runtime_tail) buf_puts(&rendered, j->req.prompt_text);
     buf_puts(&rendered, suffix_text);
 
     ds4_tokens canonical = {0};
@@ -10983,11 +11057,16 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
     free(live_text);
 
-    if (common < j->req.prompt.len) {
+    if (common < j->req.prompt.len && !openclaw_runtime_tail) {
         trace_event(s, trace_id,
                     "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
                     common, j->req.prompt.len, live_len, canonical.len);
         goto done;
+    }
+    if (openclaw_runtime_tail) {
+        trace_event(s, trace_id,
+                    "openclaw runtime-context tail canonicalization: common=%d prompt=%d live=%d canonical=%d",
+                    common, j->req.prompt.len, live_len, canonical.len);
     }
 
     char err[160] = {0};
@@ -11452,6 +11531,63 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    bool large_common_rebuild_needed = false;
+
+    /* Large exact-token common-prefix fallback.
+     *
+     * OpenClaw can replay a long resident conversation with a small rewritten
+     * tail (runtime-context/status/tool-history normalization).  The old path
+     * treated common < old_pos as a total miss and could re-prefill 70k+ tokens
+     * even when 95%+ of the live KV was still byte-for-byte token-identical.
+     *
+     * Reuse DS4's existing raw-window rewrite primitive.  It is conservative:
+     * DS4_SESSION_REWRITE_OK means the changed tail fit in the safely
+     * rewriteable live window.  REBUILD_NEEDED or any failure leaves the old
+     * disk/full fallback behavior in place.
+     *
+     * Restrict this to substantial chat/tool contexts so tiny unrelated
+     * auxiliary requests do not churn a large resident session. */
+    if (cached == 0 &&
+        j->req.kind == REQ_CHAT &&
+        j->req.has_tools &&
+        old_pos > 0 &&
+        common >= 2048 &&
+        common < old_pos &&
+        common < j->req.prompt.len)
+    {
+        const int discarded = old_pos - common;
+        const int replacement = j->req.prompt.len - common;
+        char rewrite_err[160] = {0};
+
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_rewrite_result rr =
+            ds4_session_rewrite_from_common(slot->session, &j->req.prompt,
+                                            common,
+                                            rewrite_err, sizeof(rewrite_err));
+        pthread_mutex_unlock(&s->inference_mu);
+
+        if (rr == DS4_SESSION_REWRITE_OK) {
+            cached = common;
+            cache_source = "memory-common-rewrite";
+            cache_diag.rewind_to = common;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: reused large live common prefix common=%d old=%d prompt=%d discard=%d rewrite=%d",
+                       common, old_pos, j->req.prompt.len,
+                       discarded, replacement);
+        } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+            large_common_rebuild_needed = true;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: large live common prefix needs rebuild common=%d old=%d prompt=%d discard=%d rewrite=%d",
+                       common, old_pos, j->req.prompt.len,
+                       discarded, replacement);
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: large live common prefix rewrite failed common=%d old=%d prompt=%d error=%s",
+                       common, old_pos, j->req.prompt.len,
+                       rewrite_err[0] ? rewrite_err : "unknown");
+        }
+    }
+
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
@@ -11460,11 +11596,22 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    trace_cache_miss_reason(&cache_diag));
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens &&
+        !large_common_rebuild_needed)
+    {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
+         * would silently discard the newer conversation state.
+         *
+         * v6 exception: when a large live common prefix already proved useful
+         * but raw-window rewrite needs a rebuild, preserve existing disk
+         * checkpoints first. Storing the current ~80k live state can evict the
+         * older ~70k prefix that is exactly what we need for a cheap rebuild. */
         kv_cache_store_current(s, slot, "evict");
+    } else if (s->kv.enabled && cached == 0 && large_common_rebuild_needed) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: preserving disk checkpoints before large-common rebuild common=%d old=%d prompt=%d",
+                   common, old_pos, j->req.prompt.len);
     }
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -12360,9 +12507,17 @@ decode_again:
         }
     }
 
+    buf openclaw_gate_probe = {0};
+    const bool openclaw_runtime_tail_for_tool =
+        j->req.kind == REQ_CHAT && parsed_calls.len &&
+        j->req.api != API_RESPONSES &&
+        build_openclaw_replay_checkpoint_base(&j->req, &openclaw_gate_probe);
+    buf_free(&openclaw_gate_probe);
+
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        (openclaw_runtime_tail_for_tool ||
+         should_canonicalize_tool_checkpoint(s, &parsed_calls)))
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
@@ -12384,7 +12539,8 @@ decode_again:
              * instead of re-prefilling the entire conversation. */
             remember_tool_visible_checkpoint(s, slot, j, ctx_span, trace_id,
                                              parsed_content ? parsed_content : "",
-                                             parsed_reasoning, &parsed_calls, true);
+                                             NULL,
+                                             &parsed_calls, true);
         } else {
             thinking_live_clear(s, slot);
         }
@@ -12402,7 +12558,8 @@ decode_again:
          * to raw token matching, which cannot bridge hidden reasoning tokens. */
         remember_tool_visible_checkpoint(s, slot, j, ctx_span, trace_id,
                                          parsed_content ? parsed_content : "",
-                                         parsed_reasoning, NULL, false);
+                                         NULL,
+                                         NULL, false);
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -12600,7 +12757,27 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
-    int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+
+    const int common =
+        ds4_session_common_prefix(slot->session, &j->req.prompt);
+    const int live = ds4_session_pos(slot->session);
+
+    /* Resident-slot affinity:
+     *
+     * A tiny accidental prefix (often just BOS, common=1) must not beat an
+     * empty/short slot. OpenClaw interleaves very small status/runtime requests
+     * with a long main-agent conversation; the old score returned `common`
+     * directly, so common=1 on a 70k resident session beat common=0 on an empty
+     * slot and destroyed the valuable long KV frontier.
+     *
+     * Meaningful prefix reuse still wins normally. When there is no meaningful
+     * affinity, prefer the shortest resident context so unrelated auxiliary
+     * requests evict the cheapest slot. */
+    enum { RESIDENT_AFFINITY_MIN_COMMON = 32 };
+    if (common < RESIDENT_AFFINITY_MIN_COMMON) {
+        if (live > INT_MAX / 2) return INT_MIN + 1;
+        return -live;
+    }
     return common;
 }
 

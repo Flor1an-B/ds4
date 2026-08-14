@@ -535,7 +535,6 @@ double ds4_kvstore_entry_eviction_score(
         uint64_t now,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
-    (void)live;
     double effective_hits = (double)e->hits;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
@@ -550,10 +549,28 @@ double ds4_kvstore_entry_eviction_score(
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
-        double h = effective_hits > 0.0 ?
-            effective_hits / (effective_hits + 1.0) : 0.0;
-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+        /* Keep the immediately previous continued waypoint as a rebuild
+         * anchor. With the default 10k interval aligned to 2048, adjacent
+         * waypoints are 10240 tokens apart. OpenClaw can rewrite a several-k
+         * token tail after tool/runtime-context normalization; retaining one
+         * prior waypoint prevents a canonical rebuild from falling back to
+         * token zero.
+         *
+         * Older superseded waypoints keep the original cheap-victim policy.
+         * 16384 intentionally covers one default/aligned interval, but not two
+         * (20480), so disk growth remains bounded by the normal eviction pass. */
+        const bool adjacent_rebuild_anchor =
+            live && live->len > (int)e->tokens &&
+            live->len - (int)e->tokens <= 16384;
+
+        if (adjacent_rebuild_anchor) {
+            score *= 8.0;
+        } else {
+            double h = effective_hits > 0.0 ?
+                effective_hits / (effective_hits + 1.0) : 0.0;
+            score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
+                     KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+        }
     }
     return score;
 }
