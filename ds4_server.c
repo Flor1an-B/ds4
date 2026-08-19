@@ -15736,7 +15736,7 @@ static void test_render_glm_low_effort_has_no_prefix(void) {
     chat_msgs_push(&msgs, user);
 
     char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_LOW);
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_LOW, false);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "Reasoning Effort:") == NULL);
     TEST_ASSERT(strstr(prompt, "<|user|>Hello<|assistant|><think>") != NULL);
