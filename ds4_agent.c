@@ -5381,8 +5381,10 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
     if (ok && (visual || hdr.payload_bytes != 0) &&
         (hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine) ||
-         hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))) {
-        snprintf(err, err_len, "session was written for a different model or quantization"); ok = false;
+         hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine) ||
+         (hdr.weights_fp24 != 0 &&
+          hdr.weights_fp24 != ds4_engine_weights_fp24(w->engine)))) {
+        snprintf(err, err_len, "session was written for a different model, quantization, or weights"); ok = false;
     }
     if (ok && expected_text && ((size_t)text_bytes != expected_text_len ||
         memcmp(text, expected_text, expected_text_len))) {
@@ -5575,7 +5577,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     }
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
+    ds4_kvstore_fill_header(h, (uint8_t)model_id,
+                            ds4_engine_weights_fp24(w->engine),
+                            (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
                             (session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0) |
                             (visual ? DS4_KVSTORE_EXT_AGENT_INPUT : 0),
@@ -6960,7 +6964,8 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     }
     if (ok) {
         uint8_t header[DS4_KVSTORE_FIXED_HEADER], length[4];
-        ds4_kvstore_fill_header(header, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+        ds4_kvstore_fill_header(header, hdr.model_id, hdr.weights_fp24,
+                               hdr.quant_bits, hdr.reason, hdr.ext_flags,
                                count, hdr.hits, hdr.ctx_size, hdr.created_at, time(NULL), 0);
         if (visual) header[3] = DS4_KVSTORE_AGENT_VERSION;
         ds4_kvstore_le_put32(length, text_bytes);
