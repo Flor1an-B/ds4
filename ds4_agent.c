@@ -5383,6 +5383,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         (hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine) ||
          hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine) ||
          (hdr.weights_fp24 != 0 &&
+          hdr.quant_bits == (uint8_t)ds4_engine_routed_quant_bits(w->engine) &&
           hdr.weights_fp24 != ds4_engine_weights_fp24(w->engine)))) {
         snprintf(err, err_len, "session was written for a different model, quantization, or weights"); ok = false;
     }

@@ -12603,6 +12603,8 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
         if (ok && hdr.model_id == model_id &&
             (hdr.weights_fp24 == 0 || !s->engine ||
+             hdr.quant_bits !=
+                 (uint8_t)ds4_engine_routed_quant_bits(s->engine) ||
              hdr.weights_fp24 == ds4_engine_weights_fp24(s->engine)) &&
             (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
@@ -26211,6 +26213,7 @@ static void test_kv_stub_file(const char *dir, const char *sha,
 static void test_kv_text_stub_file_used(const char *dir, const char *text,
                                         uint8_t model_id,
                                         uint32_t weights_fp24,
+                                        uint8_t quant_bits,
                                         uint8_t reason,
                                         uint32_t tokens, uint32_t hits,
                                         uint64_t created_at, uint64_t last_used,
@@ -26228,8 +26231,8 @@ static void test_kv_text_stub_file_used(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, weights_fp24, 2, reason, 0, tokens, hits,
-                            32768, created_at, last_used, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, weights_fp24, quant_bits, reason, 0,
+                            tokens, hits, 32768, created_at, last_used, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -26245,17 +26248,18 @@ static void test_kv_text_stub_file_used(const char *dir, const char *text,
 static void test_kv_text_stub_file_model(const char *dir, const char *text,
                                          uint8_t model_id,
                                          uint32_t weights_fp24,
+                                         uint8_t quant_bits,
                                          uint8_t reason,
                                          uint32_t tokens,
                                          uint64_t payload_bytes) {
-    test_kv_text_stub_file_used(dir, text, model_id, weights_fp24, reason,
-                                tokens, 0, 100, 100, payload_bytes);
+    test_kv_text_stub_file_used(dir, text, model_id, weights_fp24, quant_bits,
+                                reason, tokens, 0, 100, 100, payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
                                    uint8_t reason,
                                    uint32_t tokens, uint64_t payload_bytes) {
-    test_kv_text_stub_file_model(dir, text, 0, 0, reason, tokens, payload_bytes);
+    test_kv_text_stub_file_model(dir, text, 0, 0, 2, reason, tokens, payload_bytes);
 }
 
 static char test_kv_lookup_log_last[512];
@@ -26371,7 +26375,7 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     if (!dir) return;
 
     const char *text = "shared rendered prefix";
-    test_kv_text_stub_file_model(dir, text, 1, 0, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text, 1, 0, 2, KV_REASON_COLD, 512, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -26407,9 +26411,15 @@ static void test_kv_cache_lookup_rejects_wrong_weights(void) {
     const char *text_a = "prompt cached under weights A";
     const char *text_b = "prompt cached under weights B";
     const char *text_legacy = "prompt cached before fingerprints";
-    test_kv_text_stub_file_model(dir, text_a, 0, 0x00A11CEu, KV_REASON_COLD, 512, 0);
-    test_kv_text_stub_file_model(dir, text_b, 0, 0x00B0BB0u, KV_REASON_COLD, 512, 0);
-    test_kv_text_stub_file_model(dir, text_legacy, 0, 0, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text_a, 0, 0x00A11CEu, 2, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text_b, 0, 0x00B0BB0u, 2, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text_legacy, 0, 0, 2, KV_REASON_COLD, 512, 0);
+    /* A q4 checkpoint of the SAME logical model: fingerprints necessarily
+     * differ across quants, so the fingerprint must not veto it — the
+     * existing reject_different_quant policy stays the only cross-quant
+     * gate. */
+    const char *text_q4 = "prompt cached under the q4 requant";
+    test_kv_text_stub_file_model(dir, text_q4, 0, 0x00C4C4Cu, 4, KV_REASON_COLD, 512, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -26426,9 +26436,13 @@ static void test_kv_cache_lookup_rejects_wrong_weights(void) {
      * model_id 0 does for old cache files. */
     idx = ds4_kvstore_find_text_prefix(&kc, text_legacy, 0, 0x00A11CEu, 2, 32768);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].weights_fp24 == 0);
+    /* ...and the cross-quant checkpoint stays reusable despite the
+     * different fingerprint (reject_different_quant is false here). */
+    idx = ds4_kvstore_find_text_prefix(&kc, text_q4, 0, 0x00A11CEu, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].quant_bits == 4);
 
     kv_cache_close(&kc);
-    const char *texts[] = {text_a, text_b, text_legacy};
+    const char *texts[] = {text_a, text_b, text_legacy, text_q4};
     for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
         char sha[41], name[44];
         sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
@@ -26607,7 +26621,7 @@ static void test_agent_kv_files_are_not_server_cache_candidates(void) {
     ds4_kvstore_entry_free(&entry);
     TEST_ASSERT(!ds4_kvstore_touch_file(path, 99));
 
-    test_kv_text_stub_file_model(dir, server_text, 5, 0, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, server_text, 5, 0, 2, KV_REASON_COLD, 512, 0);
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "agent input prefix tail", 5, 0, 2, 32768) < 0);
     TEST_ASSERT(kc.len == 1); /* v2 is not counted, touched or offered to eviction. */
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "server input prefix tail", 5, 0, 2, 32768) >= 0);
@@ -27533,9 +27547,9 @@ static void test_kv_cache_eviction_protects_checkpoint_about_to_load(void) {
         TEST_ASSERT(dir != NULL);
         if (!dir) return;
 
-        test_kv_text_stub_file_used(dir, old_text, 0, 0, KV_REASON_COLD,
+        test_kv_text_stub_file_used(dir, old_text, 0, 0, 2, KV_REASON_COLD,
                                     2048, 3, hour_ago, hour_ago, 2048);
-        test_kv_text_stub_file_used(dir, main_text, 0, 0, KV_REASON_EVICT,
+        test_kv_text_stub_file_used(dir, main_text, 0, 0, 2, KV_REASON_EVICT,
                                     2048, 0, now, now, 2048);
         char *old_path = test_kv_text_path(dir, old_text);
         char *main_path = test_kv_text_path(dir, main_text);
@@ -27591,7 +27605,7 @@ static void test_kv_cache_eviction_protects_after_earlier_victims(void) {
      * victims sit before it and are deleted first, which shifts its index. */
     const char *texts[3] = {"transcript a", "transcript b", "transcript c"};
     for (int i = 0; i < 3; i++)
-        test_kv_text_stub_file_used(dir, texts[i], 0, 0, KV_REASON_COLD,
+        test_kv_text_stub_file_used(dir, texts[i], 0, 0, 2, KV_REASON_COLD,
                                     2048, 0, 100, 100, 2048);
 
     kv_disk_cache kc = {0};
@@ -27606,7 +27620,7 @@ static void test_kv_cache_eviction_protects_after_earlier_victims(void) {
 
     /* The protected entry is the cheapest victim: a stale, never-hit
      * continued checkpoint.  Rewriting in place keeps the directory order. */
-    test_kv_text_stub_file_used(dir, texts[last], 0, 0, KV_REASON_CONTINUED,
+    test_kv_text_stub_file_used(dir, texts[last], 0, 0, 2, KV_REASON_CONTINUED,
                                 2048, 0, 100, 100, 2048);
     char protect_text[64];
     snprintf(protect_text, sizeof(protect_text), "%s\nuser: next", texts[last]);
@@ -27648,9 +27662,9 @@ static void test_kv_cache_eviction_keeps_protected_checkpoint_when_full(void) {
     const char *main_text = "main agent transcript";
     const char *sub_text = "subagent transcript";
     const uint64_t now = (uint64_t)time(NULL);
-    test_kv_text_stub_file_used(dir, small_text, 0, 0, KV_REASON_COLD,
+    test_kv_text_stub_file_used(dir, small_text, 0, 0, 2, KV_REASON_COLD,
                                 1024, 0, 100, 100, 256);
-    test_kv_text_stub_file_used(dir, main_text, 0, 0, KV_REASON_EVICT,
+    test_kv_text_stub_file_used(dir, main_text, 0, 0, 2, KV_REASON_EVICT,
                                 2048, 0, now, now, 2048);
     char *small_path = test_kv_text_path(dir, small_text);
     char *main_path = test_kv_text_path(dir, main_text);
