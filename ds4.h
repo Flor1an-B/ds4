@@ -151,6 +151,7 @@ typedef struct {
     bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
+    bool dspark_stochastic;
     bool dspark_confidence_threshold_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
@@ -378,6 +379,17 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+bool ds4_test_dspark_token_prob(const float *logits, uint32_t n_vocab,
+                                float temperature, int token,
+                                float *out_prob);
+int ds4_test_dspark_sample_residual(const float *p_logits,
+                                    const float *q_logits,
+                                    uint32_t n_vocab, float temperature,
+                                    uint64_t *rng, float *scratch);
+bool ds4_test_qkv_compressor_batch_matches_sequential(
+        ds4_engine *e, uint32_t il, uint32_t n_tokens, uint32_t pos0,
+        float *out_max_abs_diff_qr, float *out_max_abs_diff_kv,
+        float *out_max_abs_diff_comp_kv, float *out_max_abs_diff_comp_sc);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
@@ -409,6 +421,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+bool ds4_engine_dspark_stochastic(ds4_engine *e);
+/* Enable/disable stochastic (accept/reject + residual resample) DSpark
+ * verification for the next ds4_session_eval_speculative_argmax() cycles on
+ * this session. Correct only for temperature > 0 with no top_p/top_k/min_p
+ * truncation (top_p >= 1, top_k <= 0, min_p <= 0) -- callers must not enable
+ * this outside that case. rng must stay valid for as long as stochastic mode
+ * is enabled. */
+void ds4_session_set_dspark_stochastic(ds4_session *s, bool enabled,
+                                       float temperature, uint64_t *rng);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */

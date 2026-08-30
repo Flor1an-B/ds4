@@ -583,6 +583,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
+    const bool dspark_stochastic_active = cfg->gen.temperature > 0.0f &&
+        cfg->gen.top_p >= 1.0f && cfg->gen.min_p <= 0.0f &&
+        ds4_engine_dspark_stochastic(engine) &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+    ds4_session_set_dspark_stochastic(session, dspark_stochastic_active,
+                                      cfg->gen.temperature, &rng);
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
@@ -597,8 +603,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if ((cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+             getenv("DS4_MTP_SPEC_DISABLE") == NULL) || dspark_stochastic_active) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
@@ -1488,6 +1494,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
+    const bool dspark_stochastic_active = cfg->gen.temperature > 0.0f &&
+        cfg->gen.top_p >= 1.0f && cfg->gen.min_p <= 0.0f &&
+        ds4_engine_dspark_stochastic(engine) &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+    ds4_session_set_dspark_stochastic(chat->session, dspark_stochastic_active,
+                                      cfg->gen.temperature, &rng);
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
@@ -1506,8 +1518,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if ((cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+             getenv("DS4_MTP_SPEC_DISABLE") == NULL) || dspark_stochastic_active) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
@@ -1859,6 +1871,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--dspark-stochastic")) {
+            c.engine.dspark = true;
+            c.engine.dspark_stochastic = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

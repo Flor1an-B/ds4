@@ -20583,6 +20583,146 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
     return 1;
 }
 
+/* Row-batched projection-only sibling of ds4_gpu_qkv_pair_quad_compressor_store_tensor:
+ * computes q_a, kv, compressor_kv and compressor_gate for `n_tokens`
+ * independent activation rows in one dispatch. Deliberately does not touch
+ * the compressed-cache "state append" step -- that stays the caller's
+ * existing per-row loop, unchanged, fed by this function's qr/kv_raw/
+ * cdst_a/cdst_b outputs exactly as it already consumes the six unfused
+ * per-row dispatches this replaces. See the shader comment in
+ * metal/dense.metal above kernel_dsv4_qkv_pair_quad_compressor_project_batch_q8_0
+ * for why the state-append step cannot be folded in here. */
+int ds4_gpu_qkv_pair_quad_compressor_project_batch_tensor(
+        ds4_gpu_tensor       *qr,
+        ds4_gpu_tensor       *kv_raw,
+        ds4_gpu_tensor       *out0_kv,
+        ds4_gpu_tensor       *out0_score,
+        ds4_gpu_tensor       *out1_kv,
+        ds4_gpu_tensor       *out1_score,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_a_offset,
+        uint64_t              kv_offset,
+        uint64_t              weight0_kv_offset,
+        uint64_t              weight0_score_offset,
+        uint64_t              weight1_kv_offset,
+        uint64_t              weight1_score_offset,
+        uint32_t              in_dim,
+        uint32_t              q_rank,
+        uint32_t              kv_dim,
+        uint32_t              width0,
+        uint32_t              width1,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!qr || !kv_raw || !out0_kv || !out0_score || !out1_kv || !out1_score ||
+        !model_map || !x || n_tokens == 0u || (in_dim & 31u) != 0 ||
+        (width0 & 1u) != 0 || (width1 & 1u) != 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t q8_row_bytes = (in_dim / 32u) * 34u;
+        const uint64_t q_a_bytes = (uint64_t)q_rank * q8_row_bytes;
+        const uint64_t kv_bytes = (uint64_t)kv_dim * q8_row_bytes;
+        const uint64_t f16_row_bytes = (uint64_t)in_dim * sizeof(uint16_t);
+        const uint64_t weight0_bytes = (uint64_t)width0 * f16_row_bytes;
+        const uint64_t weight1_bytes = (uint64_t)width1 * f16_row_bytes;
+        if (q_a_offset > model_size || q_a_bytes > model_size - q_a_offset ||
+            kv_offset > model_size || kv_bytes > model_size - kv_offset ||
+            weight0_kv_offset > model_size ||
+            weight0_bytes > model_size - weight0_kv_offset ||
+            weight0_score_offset > model_size ||
+            weight0_bytes > model_size - weight0_score_offset ||
+            weight1_kv_offset > model_size ||
+            weight1_bytes > model_size - weight1_kv_offset ||
+            weight1_score_offset > model_size ||
+            weight1_bytes > model_size - weight1_score_offset) {
+            return -1;
+        }
+        if (ds4_gpu_tensor_bytes(qr) < (uint64_t)n_tokens * q_rank * sizeof(float) ||
+            ds4_gpu_tensor_bytes(kv_raw) < (uint64_t)n_tokens * kv_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out0_kv) < (uint64_t)n_tokens * width0 * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out0_score) < (uint64_t)n_tokens * width0 * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out1_kv) < (uint64_t)n_tokens * width1 * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out1_score) < (uint64_t)n_tokens * width1 * sizeof(float) ||
+            ds4_gpu_tensor_bytes(x) < (uint64_t)n_tokens * in_dim * sizeof(float)) {
+            return -1;
+        }
+
+        uint64_t q_a_inner = 0, kv_inner = 0;
+        uint64_t w0kv_inner = 0, w0sc_inner = 0, w1kv_inner = 0, w1sc_inner = 0;
+        id<MTLBuffer> qw0buf = ds4_gpu_wrap_model_range(model_map, model_size, q_a_offset, q_a_bytes, &q_a_inner);
+        id<MTLBuffer> qw1buf = ds4_gpu_wrap_model_range(model_map, model_size, kv_offset, kv_bytes, &kv_inner);
+        id<MTLBuffer> w0kvbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight0_kv_offset, weight0_bytes, &w0kv_inner);
+        id<MTLBuffer> w0scbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight0_score_offset, weight0_bytes, &w0sc_inner);
+        id<MTLBuffer> w1kvbuf = width1 != 0u
+            ? ds4_gpu_wrap_model_range(model_map, model_size, weight1_kv_offset,
+                                       weight1_bytes, &w1kv_inner)
+            : w0kvbuf;
+        id<MTLBuffer> w1scbuf = width1 != 0u
+            ? ds4_gpu_wrap_model_range(model_map, model_size, weight1_score_offset,
+                                       weight1_bytes, &w1sc_inner)
+            : w0scbuf;
+        if (width1 == 0u) {
+            w1kv_inner = w0kv_inner;
+            w1sc_inner = w0sc_inner;
+        }
+        if (!qw0buf || !qw1buf || !w0kvbuf || !w0scbuf || !w1kvbuf || !w1scbuf) return -1;
+
+        ds4_gpu_q8_0_matvec_args args0 = ds4_gpu_make_q8_0_mv_args(in_dim, q_rank);
+        ds4_gpu_q8_0_matvec_args args1 = ds4_gpu_make_q8_0_mv_args(in_dim, kv_dim);
+        args0.nr0 = 2;
+        args1.nr0 = 2;
+        ds4_gpu_f16_matvec_args cargs = ds4_gpu_make_f16_mv_args(in_dim, width0);
+        cargs.nr0 = 2;
+        cargs.ne1 = (int32_t)n_tokens;
+        const uint32_t max_out = q_rank > kv_dim ? q_rank : kv_dim;
+        const uint32_t pair_vtgs = (max_out + 1u) / 2u;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            "kernel_dsv4_qkv_pair_quad_compressor_project_batch_q8_0", 8);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args0 length:sizeof(args0) atIndex:0];
+        [enc setBytes:&args1 length:sizeof(args1) atIndex:1];
+        [enc setBytes:&cargs length:sizeof(cargs) atIndex:2];
+        [enc setBytes:&pair_vtgs length:sizeof(pair_vtgs) atIndex:3];
+        [enc setBytes:&width0 length:sizeof(width0) atIndex:4];
+        [enc setBytes:&width1 length:sizeof(width1) atIndex:5];
+        [enc setBuffer:qw0buf offset:(NSUInteger)q_a_inner atIndex:6];
+        [enc setBuffer:qw1buf offset:(NSUInteger)kv_inner atIndex:7];
+        [enc setBuffer:w0kvbuf offset:(NSUInteger)w0kv_inner atIndex:8];
+        [enc setBuffer:w0scbuf offset:(NSUInteger)w0sc_inner atIndex:9];
+        [enc setBuffer:w1kvbuf offset:(NSUInteger)w1kv_inner atIndex:10];
+        [enc setBuffer:w1scbuf offset:(NSUInteger)w1sc_inner atIndex:11];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:12];
+        [enc setBuffer:ds4_gpu_tensor_buffer(qr) offset:ds4_gpu_tensor_offset(qr) atIndex:13];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv_raw) offset:ds4_gpu_tensor_offset(kv_raw) atIndex:14];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out0_kv) offset:ds4_gpu_tensor_offset(out0_kv) atIndex:15];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out0_score) offset:ds4_gpu_tensor_offset(out0_score) atIndex:16];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out1_kv) offset:ds4_gpu_tensor_offset(out1_kv) atIndex:17];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out1_score) offset:ds4_gpu_tensor_offset(out1_score) atIndex:18];
+        [enc setThreadgroupMemoryLength:2u * 2u * 2u * 32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (NSUInteger)(pair_vtgs + 1u) / 2u +
+                ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, n_tokens, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "qkv pair + quad compressor project batch")) {
+            return -1;
+        }
+    }
+
+    return 1;
+}
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

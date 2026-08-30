@@ -186,6 +186,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: Metal 0.6; CUDA/ROCm 0.7");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
+            opt(fp, c, "--dspark-stochastic", "Accept/reject DSpark drafts by probability ratio with residual resampling, so DSpark helps under --temp > 0 (only with top-p 1, min-p 0).");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");

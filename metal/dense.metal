@@ -1399,6 +1399,194 @@ kernel void kernel_dsv4_qkv_pair_quad_compressor_store_q8_0(
     state_score[dst] = projected_score[col] + ape_v;
 }
 
+/* Row-batched projection-only sibling of kernel_dsv4_qkv_pair_quad_compressor_store_q8_0:
+ * computes q_a, kv, compressor_kv and compressor_gate for `rows` independent
+ * activation rows in one dispatch, using threadgroup-position.y as the row
+ * index. Each row's projections depend only on that row's own activation --
+ * there is no cross-row reduction here, so this is a pure batching of
+ * independent work, not a new numerical algorithm. Unlike the single-row
+ * kernel, this does NOT perform the compressed-cache "state append" tail:
+ * that step folds each row's projection into a small ratio-sized rotating
+ * staging buffer keyed by pos % ratio, which genuinely collides across rows
+ * (row r and row r+ratio target the same staging slot) and must stay a
+ * per-position sequential operation done by the existing, already-correct
+ * caller-side loop -- this kernel only replaces the unfused matmuls feeding
+ * that loop, exactly matching kernel_dsv4_qkv_pair_quad_compressor_store_q8_0's
+ * qr/kv_raw/cdst_a/cdst_b outputs for the caller to consume identically. */
+kernel void kernel_dsv4_qkv_pair_quad_compressor_project_batch_q8_0(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        constant ds4_metal_args_mul_mv & cargs,
+        constant uint & pair_vtgs,
+        constant uint & store0_width,
+        constant uint & store1_width,
+        device const char * qw0,
+        device const char * qw1,
+        device const char * cw0a,
+        device const char * cw0b,
+        device const char * cw1a,
+        device const char * cw1b,
+        device const char * src1,
+        device       char * dst0,
+        device       char * dst1,
+        device       char * cdst_a0,
+        device       char * cdst_b0,
+        device       char * cdst_a1,
+        device       char * cdst_b1,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        ushort tiitg  [[thread_index_in_threadgroup]],
+        ushort tiisg  [[thread_index_in_simdgroup]],
+        ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    constexpr short NW = N_SIMDWIDTH;
+    const uint pair_ctgs = (pair_vtgs + 1u) / 2u;
+    const uint row = tgpig.y;
+
+    if (tgpig.x < pair_ctgs) {
+        /* Verbatim body of the Q8 pair range above, with every activation
+         * read and output write shifted by this dispatch's row. */
+        constexpr short NSG = 4;
+        constexpr short NQ  = 8;
+        constexpr short NR0 = 2;
+        const uint   cohort = sgitg >> 2;
+        const ushort vsg    = sgitg & 3u;
+        const uint   vt     = tgpig.x * 2u + cohort;
+        const bool   valid  = vt < pair_vtgs;
+
+        const int r0 = vt * NR0;
+        const bool active_a = valid && r0 < args0.ne01;
+        const bool active_b = valid && r0 < args1.ne01;
+        const int nb = args0.ne00 / QK8_0;
+
+        device const float *y = (device const float *)src1 + (uint64_t)row * (uint32_t)args0.ne00;
+        device const block_q8_0 *ax_a[NR0];
+        device const block_q8_0 *ax_b[NR0];
+        FOR_UNROLL (short r = 0; r < NR0; ++r) {
+            const int out_row = r0 + r;
+            ax_a[r] = active_a && out_row < args0.ne01
+                ? (device const block_q8_0 *)(qw0 + (uint64_t)out_row * args0.nb01)
+                : (device const block_q8_0 *)qw0;
+            ax_b[r] = active_b && out_row < args1.ne01
+                ? (device const block_q8_0 *)(qw1 + (uint64_t)out_row * args1.nb01)
+                : (device const block_q8_0 *)qw1;
+        }
+
+        float suma[NR0] = { 0.f };
+        float sumb[NR0] = { 0.f };
+        const short ix = tiisg / (NW / NQ);
+        const short il = tiisg % (NW / NQ);
+        const int ib0 = vsg * NQ + ix;
+        float yl[NQ];
+        device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+        if (valid) {
+            for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    yl[i] = yb[i];
+                }
+                FOR_UNROLL (short r = 0; r < NR0; ++r) {
+                    const int out_row = r0 + r;
+                    if (active_a && out_row < args0.ne01) {
+                        device const int8_t *qs = ax_a[r][ib].qs + il * NQ;
+                        float sumq = 0.f;
+                        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                            sumq += qs[i] * yl[i];
+                        }
+                        suma[r] += sumq * ax_a[r][ib].d;
+                    }
+                    if (active_b && out_row < args1.ne01) {
+                        device const int8_t *qs = ax_b[r][ib].qs + il * NQ;
+                        float sumq = 0.f;
+                        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                            sumq += qs[i] * yl[i];
+                        }
+                        sumb[r] += sumq * ax_b[r][ib].d;
+                    }
+                }
+                yb += NSG * NQ * QK8_0;
+            }
+        }
+
+        threadgroup float *shared =
+            (threadgroup float *)shmem + cohort * (2 * NR0 * NW);
+        threadgroup float *sha[NR0];
+        threadgroup float *shb[NR0];
+        FOR_UNROLL (short r = 0; r < NR0; ++r) {
+            sha[r] = shared + NW * r;
+            shb[r] = shared + NW * (NR0 + r);
+            if (vsg == 0) {
+                sha[r][tiisg] = 0.0f;
+                if (active_b) shb[r][tiisg] = 0.0f;
+            }
+            suma[r] = simd_sum(suma[r]);
+            if (active_b) sumb[r] = simd_sum(sumb[r]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short r = 0; r < NR0; ++r) {
+            if (tiisg == 0) {
+                sha[r][vsg] = suma[r];
+                if (active_b) shb[r][vsg] = sumb[r];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device float *out_a = (device float *)dst0 + (uint64_t)row * (uint32_t)args0.ne01;
+        device float *out_b = (device float *)dst1 + (uint64_t)row * (uint32_t)args1.ne01;
+        FOR_UNROLL (short r = 0; r < NR0; ++r) {
+            const float total_a = simd_sum(sha[r][tiisg]);
+            if (tiisg == 0 && vsg == 0) {
+                const int out_row = r0 + r;
+                if (active_a && out_row < args0.ne01) out_a[out_row] = total_a;
+            }
+            if (active_b) {
+                const float total_b = simd_sum(shb[r][tiisg]);
+                if (tiisg == 0 && vsg == 0) {
+                    const int out_row = r0 + r;
+                    if (out_row < args1.ne01) out_b[out_row] = total_b;
+                }
+            }
+        }
+        return;
+    }
+
+    /* Compressor quad range: identical dispatch shape to the single-row
+     * kernel; row batching for this half comes entirely from cargs.ne1 and
+     * the dispatch's y size, both of which kernel_mul_mv_f16_f32_pair_4_impl
+     * already honors via tgpig.y (r1) -- no change needed here. */
+    constexpr short NR0 = 2;
+    const uint lx = tgpig.x - pair_ctgs;
+    const uint tgs0 = ((uint)store0_width + NR0 - 1u) / NR0;
+    const bool second = lx >= tgs0;
+
+    uint3 local_tgpig = tgpig;
+    local_tgpig.x = second ? lx - tgs0 : lx;
+
+    ds4_metal_args_mul_mv largs = cargs;
+    largs.nr0 = NR0;
+    largs.ne01 = second ? (int32_t)store1_width : (int32_t)store0_width;
+    /* ne0 is the per-row output stride (dst_a + im*ne0*ne1 + r1*ne0 inside
+     * kernel_mul_mv_f16_f32_pair_4_impl). cargs was built from width0 only
+     * (ds4_gpu_make_f16_mv_args(in_dim, width0)); the single-row kernel this
+     * is adapted from never noticed ne0 being wrong for the "second"/width1
+     * branch because r1 (tgpig.y) was always 0 there (n_tokens==1). With
+     * n_tokens>1 an unset ne0 leaves every row writing to the same offset. */
+    largs.ne0 = largs.ne01;
+
+    if (!second) {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, cw0a, cw0b, src1, cdst_a0, cdst_b0,
+                shmem, local_tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, cw1a, cw1b, src1, cdst_a1, cdst_b1,
+                shmem, local_tgpig, tiisg, sgitg);
+    }
+}
+
 template<typename T0, typename T1, typename args_t>
 void kernel_mul_mv_t_t_short_impl(
         args_t args,

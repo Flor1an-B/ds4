@@ -109,6 +109,18 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+ds4_metal_test_hooks.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -c -o $@ ds4.c
+
+tests/test_qkv_compressor_batch.o: tests/test_qkv_compressor_batch.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qkv_compressor_batch.c
+
+tests/test_qkv_compressor_batch: tests/test_qkv_compressor_batch.o ds4_metal_test_hooks.o ds4_metal.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-qkv-compressor-batch: tests/test_qkv_compressor_batch
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_qkv_compressor_batch
+
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -361,6 +373,12 @@ tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4
 tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_dspark_stochastic.o: tests/test_dspark_stochastic.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dspark_stochastic: tests/test_dspark_stochastic.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
@@ -442,12 +460,14 @@ endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_dspark_stochastic \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
+	./tests/test_dspark_stochastic
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
