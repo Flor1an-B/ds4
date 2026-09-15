@@ -130,6 +130,15 @@ tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_O
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/test_metal_rewind.o: tests/test_metal_rewind.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_metal_rewind.c
+
+tests/test_metal_rewind: tests/test_metal_rewind.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-metal-rewind: tests/test_metal_rewind
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_rewind
+
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
