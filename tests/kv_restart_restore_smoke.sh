@@ -18,13 +18,16 @@ served from the cache.  Also checks that the shutdown checkpoint was keyed by
 the client-visible transcript and that B's turns continued from live KV.
 
 Skips (exit 0) when the model file is missing.  Needs python3 and ~10 minutes
-on a DeepSeek Flash class model.
+on a Flash class model (DeepSeek, DeepSeek 4.1, GLM, Qwen3.8).
 
 Environment:
   DS4_SERVER_BIN=./ds4-server
   DS4_TEST_MODEL=ds4flash.gguf
   DS4_KV_RESTORE_PORT=8199
   DS4_KV_RESTORE_CTX=32768
+  DS4_KV_RESTORE_PREFILL_CHUNK=1024 set empty to omit --prefill-chunk, needed
+                                    for syntaxes that reject it (GLM selects its
+                                    own graph prefill chunks)
   DS4_KV_RESTORE_EXTRA_ARGS=""      (extra ds4-server args, e.g. "--gpu-devices 0")
   DS4_KV_RESTORE_KEEP=1             keep the temp dir (logs, kv files)
 USAGE
@@ -36,7 +39,11 @@ model=${1:-${DS4_TEST_MODEL:-ds4flash.gguf}}
 port=${DS4_KV_RESTORE_PORT:-8199}
 ctx=${DS4_KV_RESTORE_CTX:-32768}
 extra=${DS4_KV_RESTORE_EXTRA_ARGS:-}
+# GLM 5.x rejects --prefill-chunk, so let callers omit it for those models.
+chunk=${DS4_KV_RESTORE_PREFILL_CHUNK-1024}
+if [ -n "$chunk" ]; then chunk_arg="--prefill-chunk $chunk"; else chunk_arg=""; fi
 here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
 client="$here/kv_restart_restore_client.py"
 
 if [ ! -f "$model" ]; then
@@ -47,6 +54,19 @@ if [ ! -x "$bin" ]; then
     echo "kv-restart-restore: missing $bin (run make ds4-server)" >&2
     exit 1
 fi
+
+# The Metal backend resolves its kernels as metal/<name>.metal relative to the
+# working directory, so the server has to start from the repository root.
+# Make both paths absolute first: either may be relative to the caller, and the
+# checks above deliberately ran against the caller's view of them.
+case "$bin" in
+    /*) ;;
+    *) bin="$(pwd)/${bin#./}" ;;
+esac
+case "$model" in
+    /*) ;;
+    *) model="$(pwd)/$model" ;;
+esac
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-kv-restart.XXXXXX")
 server_pid=""
@@ -82,9 +102,9 @@ abort() {
 start_server() {
     log=$1
     # shellcheck disable=SC2086
-    DS4_LOCK_FILE="$tmpdir/ds4.lock" "$bin" -m "$model" -c "$ctx" --port "$port" \
-        --prefill-chunk 1024 --kv-disk-dir "$tmpdir/kv" --kv-disk-space-mb 4096 \
-        $extra >"$log" 2>&1 &
+    ( cd "$root" && DS4_LOCK_FILE="$tmpdir/ds4.lock" exec "$bin" -m "$model" -c "$ctx" --port "$port" \
+        $chunk_arg --kv-disk-dir "$tmpdir/kv" --kv-disk-space-mb 4096 \
+        $extra ) >"$log" 2>&1 &
     server_pid=$!
     i=0
     while ! grep -q "listening on" "$log"; do
