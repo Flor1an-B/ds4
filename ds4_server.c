@@ -3223,6 +3223,24 @@ static void append_trimmed_text(buf *out, const char *text) {
     buf_append(out, (const char *)start, (size_t)(end - start));
 }
 
+/* Body of an echoed Qwen assistant turn: trimmed content, plus, for a plain
+ * answer, its trailing whitespace so the echoed turn re-tokenizes to the
+ * sampled tokens.  Shared by the prompt renderer and by the visible-key
+ * builder so the two can never disagree on these bytes. */
+static bool append_qwen_assistant_body(buf *body, const char *content, bool has_calls) {
+    content = content ? content : "";
+    append_trimmed_text(body, content);
+    const bool has_content = body->len > 0;
+    if (has_content && !has_calls) {
+        /* keep a plain answer's trailing whitespace so the echoed turn
+         * re-tokenizes to the sampled tokens */
+        const char *end = content + strlen(content);
+        while (end > content && isspace((unsigned char)end[-1])) end--;
+        buf_append(body, end, strlen(end));
+    }
+    return has_content;
+}
+
 static void append_glm_assistant_message_prefix(buf *out,
                                                 const chat_msg *m,
                                                 bool preserve_reasoning) {
@@ -3601,15 +3619,7 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
     const char *reasoning = text.reasoning;
     const bool has_calls = m && m->calls.len > 0;
     buf body = {0};
-    append_trimmed_text(&body, content);
-    const bool has_content = body.len > 0;
-    if (has_content && !has_calls) {
-        /* keep a plain answer's trailing whitespace so the echoed turn
-         * re-tokenizes to the sampled tokens */
-        const char *end = content + strlen(content);
-        while (end > content && isspace((unsigned char)end[-1])) end--;
-        buf_append(&body, end, strlen(end));
-    }
+    const bool has_content = append_qwen_assistant_body(&body, content, has_calls);
     buf_puts(out, "<|im_start|>assistant\n");
     if (keep_reasoning && !text_starts_with_think_tag(content)) {
         /* an empty reasoning block is exactly the no-thinking generation prompt */
@@ -13682,7 +13692,9 @@ static char *build_thinking_visible_text(const request *r,
         buf visible = {0};
         buf_append(&visible, r->prompt_text, pt_len);
         buf_puts(&visible, "\n</think>\n\n");
-        append_trimmed_text(&visible, content ? content : "");
+        /* same bytes append_qwen_assistant_message() renders for a plain
+         * answer echoed verbatim by the client, trailing whitespace included */
+        append_qwen_assistant_body(&visible, content, false);
         buf_puts(&visible, "<|im_end|>\n");
         return buf_take(&visible);
     }
@@ -20233,7 +20245,9 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         chat_msgs_push(&history, h_user1);
         chat_msg h_asst = {0};
         h_asst.role = xstrdup("assistant");
-        h_asst.content = xstrdup("The answer is 4.");
+        /* clients echo content verbatim, trailing newline included; the
+         * renderer keeps it so the turn re-tokenizes to the sampled tokens */
+        h_asst.content = xstrdup("The answer is 4.\n");
         chat_msgs_push(&history, h_asst);
         chat_msg h_user2 = {0};
         h_user2.role = xstrdup("user");
@@ -20244,6 +20258,15 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         TEST_ASSERT(strlen(future) > strlen(visible));
         TEST_ASSERT(!memcmp(future, visible, strlen(visible)));
         TEST_ASSERT(!strncmp(future + strlen(visible), "<|im_start|>user\n", 17));
+        free(future);
+        /* an answer without trailing whitespace round-trips the same way */
+        free(history.v[1].content);
+        history.v[1].content = xstrdup("The answer is 4.");
+        char *visible_plain = build_thinking_visible_text(&r, "The answer is 4.");
+        future = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, &history, schemas[i], NULL, DS4_THINK_HIGH);
+        TEST_ASSERT(visible_plain && !memcmp(future, visible_plain, strlen(visible_plain)));
+        free(visible_plain);
         free(future);
         /* Echoed or edited history must not match the reasoning-free alias. */
         history.v[1].reasoning = xstrdup("2 plus 2 is 4.");
