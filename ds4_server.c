@@ -23390,6 +23390,67 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
 }
 
+static char test_kv_lookup_log_last[512];
+static void test_kv_lookup_log(void *ud, ds4_kvstore_log_type type, const char *msg) {
+    (void)ud; (void)type;
+    if (strstr(msg, "lookup skipped longer entry")) {
+        snprintf(test_kv_lookup_log_last, sizeof(test_kv_lookup_log_last), "%s", msg);
+    }
+}
+
+/* Issue #1053 asked for a log line explaining why a checkpoint was not hit.
+ * A longer entry whose key diverges from the prompt is reported with the
+ * byte offset of the divergence; shorter unrelated entries stay silent. */
+static void test_kv_cache_lookup_logs_diverging_longer_entry(void) {
+    char tmpl[] = "/tmp/ds4-kv-text-diverge-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *hit_text = "<|user|>hi<|assistant|>";
+    /* a visible key that kept the sampled reasoning, as on main */
+    const char *stale_text = "<|user|>hi<|assistant|><think>hidden</think>ok<|user|>more";
+    test_kv_text_stub_file(dir, hit_text, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file(dir, stale_text, KV_REASON_SHUTDOWN, 900, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.log = test_kv_lookup_log;
+
+    test_kv_lookup_log_last[0] = '\0';
+    const char *prompt = "<|user|>hi<|assistant|><think></think>ok<|user|>more<|assistant|>";
+    int idx = kv_cache_find_text_prefix(&kc, prompt, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 512);
+    TEST_ASSERT(strstr(test_kv_lookup_log_last, "tokens=900") != NULL);
+    TEST_ASSERT(strstr(test_kv_lookup_log_last, "key-diverges-at-byte=30") != NULL);
+    TEST_ASSERT(strstr(test_kv_lookup_log_last, "key_text=\"") != NULL);
+    TEST_ASSERT(strstr(test_kv_lookup_log_last, "<think>hidden") != NULL);
+    TEST_ASSERT(strstr(test_kv_lookup_log_last, "<think></think>ok") != NULL);
+
+    /* the longer entry is the hit: nothing to explain */
+    test_kv_lookup_log_last[0] = '\0';
+    const char *prompt2 = "<|user|>hi<|assistant|><think>hidden</think>ok<|user|>more<|assistant|>";
+    idx = kv_cache_find_text_prefix(&kc, prompt2, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 900);
+    TEST_ASSERT(test_kv_lookup_log_last[0] == '\0');
+
+    kv_cache_close(&kc);
+    char sha[41], name[44];
+    sha1_bytes_hex(hit_text, strlen(hit_text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    sha1_bytes_hex(stale_text, strlen(stale_text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -25206,6 +25267,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_lookup_logs_diverging_longer_entry();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
