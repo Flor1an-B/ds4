@@ -18722,7 +18722,7 @@ static void test_parse_qwen_tool_call_message(void) {
     char *reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls, NULL));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "need bash"));
     TEST_ASSERT(content && !strcmp(content, "OK"));
     TEST_ASSERT(calls.len == 2);
@@ -18742,7 +18742,7 @@ static void test_parse_qwen_tool_call_message(void) {
     reasoning = NULL;
     tool_calls none = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, "still thinking about <tool_call>", true, &content, &reasoning, &none));
+        SERVER_MODEL_SYNTAX_QWEN, "still thinking about <tool_call>", true, &content, &reasoning, &none, NULL));
     TEST_ASSERT(none.len == 0);
     TEST_ASSERT(content && !strcmp(content, ""));
     free(content);
@@ -18755,7 +18755,7 @@ static void test_parse_qwen_tool_call_message(void) {
     tool_calls bad = {0};
     TEST_ASSERT(!parse_generated_message_ex_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, "x</think>\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</tool_call>",
-        true, &content, &reasoning, &bad));
+        true, &content, &reasoning, &bad, NULL));
     free(content);
     free(reasoning);
     tool_calls_free(&bad);
@@ -18814,7 +18814,7 @@ static void test_qwen_literal_tool_end_in_argument(void) {
         char *content = NULL, *reasoning = NULL;
         tool_calls calls = {0};
         TEST_ASSERT(!parse_generated_message_ex_for_syntax(
-            SERVER_MODEL_SYNTAX_QWEN, bad[i], false, &content, &reasoning, &calls));
+            SERVER_MODEL_SYNTAX_QWEN, bad[i], false, &content, &reasoning, &calls, NULL));
         TEST_ASSERT(calls.len == 0);
         free(content);
         free(reasoning);
@@ -18989,7 +18989,7 @@ static void test_qwen_tool_checkpoint_round_trip(void) {
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated, true, &content, &reasoning, &calls, NULL));
     buf out = {0};
     buf_puts(&out, "OK");
     append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_QWEN, &calls, NULL);
@@ -19012,7 +19012,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     chat_msg asst = {0};
     asst.role = xstrdup("assistant");
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated.ptr, true, &asst.content, &asst.reasoning, &asst.calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated.ptr, true, &asst.content, &asst.reasoning, &asst.calls, NULL));
     buf expected = {0};
     buf_puts(&expected, "<|im_start|>assistant\n<think>\nNeed Tokyo.\n</think>\n\n\n\n");
     buf_puts(&expected, block);
@@ -19029,7 +19029,7 @@ static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     chat_msg plain = {0};
     plain.role = xstrdup("assistant");
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, block, false, &plain.content, &plain.reasoning, &plain.calls));
+        SERVER_MODEL_SYNTAX_QWEN, block, false, &plain.content, &plain.reasoning, &plain.calls, NULL));
     buf_puts(&expected, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
     buf_puts(&expected, block);
     buf_puts(&expected, "<|im_end|>\n");
@@ -19049,7 +19049,7 @@ static void test_qwen_parallel_tool_calls_parse_and_replay(void) {
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_QWEN, generated, false, &content, &reasoning, &calls));
+        SERVER_MODEL_SYNTAX_QWEN, generated, false, &content, &reasoning, &calls, NULL));
     TEST_ASSERT(calls.len == 3);
     TEST_ASSERT(!strcmp(calls.v[0].name, "get_weather") && !strcmp(calls.v[0].arguments, "{\"city\": \"Oslo\"}"));
     TEST_ASSERT(!strcmp(calls.v[1].name, "get_weather") && !strcmp(calls.v[1].arguments, "{\"city\": \"Lisbon\"}"));
@@ -23020,7 +23020,7 @@ static void test_deepseek41_server_tools(void) {
     append_dsml_tool_calls_text(&raw, &original, true);
     char *content = NULL, *reasoning = NULL;
     TEST_ASSERT(parse_generated_message_ex_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
-                raw.ptr, true, &content, &reasoning, &parsed));
+                raw.ptr, true, &content, &reasoning, &parsed, NULL));
     TEST_ASSERT(parsed.len == 1 && content && !content[0]);
     TEST_ASSERT(reasoning && !strcmp(reasoning, "Plan."));
     if (parsed.len == 1) {
