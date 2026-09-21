@@ -7194,7 +7194,16 @@ typedef struct {
  * many bytes so a short stray draft (or a </think> split across generated
  * tokens) can still be rerouted to reasoning_content.  Past this window the
  * text is treated as the answer and streamed, so ordinary responses keep
- * flushing content incrementally instead of stalling until generation ends. */
+ * flushing content incrementally instead of stalling until generation ends.
+ *
+ * This is a heuristic, not a guarantee: there is no reliable way to tell a
+ * genuine second reasoning pass from ordinary answer text that happens to
+ * be followed by something marker-shaped, so we bound the wait instead of
+ * holding indefinitely. 32 bytes covers the escaped-draft case reported in
+ * #678 with margin; a stray draft longer than that would stream as if it
+ * were the real answer. Raise this only with a concrete counter-example,
+ * since every byte added here is also a byte every tool-enabled answer
+ * risks waiting on. */
 #define SECOND_REASONING_GUARD_BYTES 32
 
 static bool stream_needs_second_reasoning_guard(const request *r) {
