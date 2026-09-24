@@ -15168,25 +15168,32 @@ decode_again:
     } else if (parsed_calls.len) {
         /* GLM consumes the DSML tool call out of the generated content, so
          * parsed_content is empty on a tool turn; the exact sampled text lives
-         * in raw_tool_text and is what the client will send back. */
-        const char *tool_turn_content = parsed_content && parsed_content[0] ?
-                                        parsed_content :
-                                        (parsed_calls.raw_tool_text ?
-                                         parsed_calls.raw_tool_text : "");
+         * in raw_tool_text and is what the client will send back. Qwen's own
+         * helper already appends calls->raw_tool_text itself
+         * (build_qwen_assistant_suffix -> append_qwen_tool_calls_text), so
+         * falling back to raw_tool_text as *content* there would render it
+         * twice -- keep the Qwen call on its original parsed_content-only
+         * input and reserve the fallback for the GLM path, which has no such
+         * built-in tool-call rendering of its own. */
+        const char *qwen_tool_turn_content = parsed_content ? parsed_content : "";
+        const char *glm_tool_turn_content = parsed_content && parsed_content[0] ?
+                                            parsed_content :
+                                            (parsed_calls.raw_tool_text ?
+                                             parsed_calls.raw_tool_text : "");
         bool checkpoint_remembered = remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
-                tool_turn_content,
+                qwen_tool_turn_content,
                 &parsed_calls);
         if (!checkpoint_remembered &&
             glm_tool_turn_checkpoint_eligible(&j->req, finish, thinking.inside,
-                                              tool_turn_content))
+                                              glm_tool_turn_content))
         {
             /* GLM has no raw-DSML replay path (should_canonicalize_tool_checkpoint
              * returns false once raw_tool_text is known) and no truncating rewind,
              * so without this the live checkpoint is cleared and every follow-up
              * turn rebuilds its prefix. */
             remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                         tool_turn_content, false);
+                                         glm_tool_turn_content, false);
             checkpoint_remembered = true;
         }
         if (!checkpoint_remembered) {
