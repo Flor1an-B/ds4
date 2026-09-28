@@ -17476,7 +17476,11 @@ static bool read_http_request(int fd, http_request *r) {
             const char *line_start = b.ptr + src_pos;
             size_t line_len = line_end - src_pos;
             size_t chunk_size;
-            if (line_len && line_start[line_len - 1] == '\r') line_len--;
+            if (!line_len || line_start[line_len - 1] != '\r') {
+                buf_free(&decoded);
+                goto fail;
+            }
+            line_len--;
             if (line_len >= 128 ||
                 !parse_chunk_size_line(line_start, line_len, max_body, &chunk_size)) {
                 buf_free(&decoded);
@@ -28654,6 +28658,8 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "1\rX\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "+1\r\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
