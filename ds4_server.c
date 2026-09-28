@@ -17262,29 +17262,56 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
-static bool has_chunked_transfer_encoding(const char *h, size_t n) {
+typedef enum {
+    HTTP_TRANSFER_ENCODING_NONE,
+    HTTP_TRANSFER_ENCODING_CHUNKED,
+    HTTP_TRANSFER_ENCODING_UNSUPPORTED,
+} http_transfer_encoding;
+
+static bool has_http_header(const char *h, size_t n,
+                            const char *name, size_t name_len) {
     const char *p = h, *end = h + n;
-    const char *te_header = "transfer-encoding";
-    size_t te_len = strlen(te_header);
     while (p < end) {
         const char *line = p;
         while (p < end && *p != '\n') p++;
         size_t len = (size_t)(p - line);
         if (len && line[len - 1] == '\r') len--;
-        if (len > te_len && strncasecmp(line, te_header, te_len) == 0 && line[te_len] == ':') {
-            const char *v = line + te_len + 1;
-            while (v < line + len && isspace((unsigned char)*v)) v++;
-            const char *val_end = line + len;
-            while (val_end > v && isspace((unsigned char)*(val_end - 1))) val_end--;
-            if (val_end - v >= 7 && strncasecmp(val_end - 7, "chunked", 7) == 0) {
-                if (val_end - v == 7 || *(val_end - 8) == ',' || isspace((unsigned char)*(val_end - 8))) {
-                    return true;
-                }
-            }
-        }
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) return true;
         if (p < end) p++;
     }
     return false;
+}
+
+static http_transfer_encoding parse_transfer_encoding(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    const char *name = "transfer-encoding";
+    const size_t name_len = sizeof("transfer-encoding") - 1;
+    bool seen = false;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            /* This server implements exactly one transfer coding: chunked.
+             * Reject repeated fields and coding chains rather than partially
+             * decoding a message whose remaining transfer coding is unknown. */
+            if (seen) return HTTP_TRANSFER_ENCODING_UNSUPPORTED;
+            seen = true;
+            const char *value = line + name_len + 1;
+            const char *value_end = line + len;
+            while (value < value_end && (*value == ' ' || *value == '\t')) value++;
+            while (value_end > value &&
+                   (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+            if ((size_t)(value_end - value) != 7 ||
+                strncasecmp(value, "chunked", 7) != 0)
+                return HTTP_TRANSFER_ENCODING_UNSUPPORTED;
+        }
+        if (p < end) p++;
+    }
+    return seen ? HTTP_TRANSFER_ENCODING_CHUNKED : HTTP_TRANSFER_ENCODING_NONE;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -17315,11 +17342,16 @@ static bool read_http_request(int fd, http_request *r) {
     if (q) *q = '\0';
 
     long clen = content_length(b.ptr, (size_t)hend);
-    bool chunked = has_chunked_transfer_encoding(b.ptr, (size_t)hend);
-    if (chunked && clen > 0) {
+    http_transfer_encoding transfer_encoding =
+        parse_transfer_encoding(b.ptr, (size_t)hend);
+    bool has_content_length = has_http_header(
+        b.ptr, (size_t)hend, "content-length", sizeof("content-length") - 1);
+    if (transfer_encoding == HTTP_TRANSFER_ENCODING_UNSUPPORTED ||
+        (transfer_encoding == HTTP_TRANSFER_ENCODING_CHUNKED && has_content_length)) {
         goto fail;
     }
-    
+    bool chunked = transfer_encoding == HTTP_TRANSFER_ENCODING_CHUNKED;
+
     if (chunked) {
         buf decoded = {0};
         size_t src_pos = (size_t)hend;
@@ -17477,7 +17509,7 @@ static bool read_http_request(int fd, http_request *r) {
             }
         }
     }
-    
+
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -28440,6 +28472,109 @@ static void test_http_image_paths_and_urls_are_rejected(void) {
     }
 }
 
+static bool parse_http_test_request(const char *raw, http_request *r) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    size_t len = strlen(raw), sent = 0;
+    while (sent < len) {
+        ssize_t n = write(sv[1], raw + sent, len - sent);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    bool ok = sent == len && shutdown(sv[1], SHUT_WR) == 0 &&
+              read_http_request(sv[0], r);
+    close(sv[0]);
+    close(sv[1]);
+    return ok;
+}
+
+static bool http_test_client_rejects_and_closes(const char *raw) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    size_t len = strlen(raw), sent = 0;
+    while (sent < len) {
+        ssize_t n = write(sv[1], raw + sent, len - sent);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    if (sent != len || shutdown(sv[1], SHUT_WR) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+
+    server s = {0};
+    if (pthread_mutex_init(&s.mu, NULL) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+    if (pthread_cond_init(&s.clients_cv, NULL) != 0) {
+        pthread_mutex_destroy(&s.mu);
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+    s.clients = 1;
+    client_arg *ca = xmalloc(sizeof(*ca));
+    ca->srv = &s;
+    ca->fd = sv[0];
+    (void)client_main(ca);
+
+    buf response = {0};
+    char tmp[1024];
+    ssize_t n;
+    do {
+        n = read(sv[1], tmp, sizeof(tmp));
+        if (n > 0) buf_append(&response, tmp, (size_t)n);
+    } while (n > 0);
+    bool closed = n == 0;
+    char *reply = buf_take(&response);
+    bool rejected = strstr(reply, "HTTP/1.1 400") != NULL;
+    bool ok = closed && rejected && s.clients == 0;
+    free(reply);
+    close(sv[1]);
+    pthread_cond_destroy(&s.clients_cv);
+    pthread_mutex_destroy(&s.mu);
+    return ok;
+    }
+
+static void test_http_transfer_encoding_accepts_only_supported_single_chunked(void) {
+    const char *valid =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: \tChUnKeD \t\r\n\r\n"
+        "4;note=yes\r\nWiki\r\n5\r\npedia\r\n"
+        "0\r\nX-Trailer: ignored\r\n\r\n";
+    http_request req = {0};
+    bool parsed = parse_http_test_request(valid, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == strlen("Wikipedia"));
+        TEST_ASSERT(memcmp(req.body, "Wikipedia", strlen("Wikipedia")) == 0);
+    }
+    http_request_free(&req);
+
+    const char *invalid[] = {
+        "GET /not-found HTTP/1.1\r\nContent-Length: 0\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\ncontent-length: 0\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        TEST_ASSERT(http_test_client_rejects_and_closes(invalid[i]));
+    }
+}
+
 static void test_anthropic_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -29088,6 +29223,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
+    test_http_transfer_encoding_accepts_only_supported_single_chunked();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
     test_openai_inline_webp_image_content();
