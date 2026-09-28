@@ -17314,6 +17314,95 @@ static http_transfer_encoding parse_transfer_encoding(const char *h, size_t n) {
     return seen ? HTTP_TRANSFER_ENCODING_CHUNKED : HTTP_TRANSFER_ENCODING_NONE;
 }
 
+static bool http_is_token_char(unsigned char c) {
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z')) return true;
+    switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void skip_http_bws(const char *s, size_t len, size_t *pos) {
+    while (*pos < len && (s[*pos] == ' ' || s[*pos] == '\t')) (*pos)++;
+}
+
+static bool parse_http_quoted_string(const char *s, size_t len, size_t *pos) {
+    if (*pos >= len || s[*pos] != '"') return false;
+    (*pos)++;
+    while (*pos < len) {
+        unsigned char c = (unsigned char)s[(*pos)++];
+        if (c == '"') return true;
+        if (c == '\\') {
+            if (*pos >= len) return false;
+            c = (unsigned char)s[(*pos)++];
+            if (c == '\t' || c == ' ' || (c >= 0x21 && c <= 0x7e) || c >= 0x80)
+                continue;
+            return false;
+        }
+        if (c == '\t' || c == ' ' || c == '!' ||
+            (c >= '#' && c <= '[') || (c >= ']' && c <= '~') || c >= 0x80)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+static bool parse_chunk_extensions(const char *s, size_t len, size_t *pos) {
+    while (*pos < len) {
+        size_t before_bws = *pos;
+        skip_http_bws(s, len, pos);
+        if (*pos == len) return *pos == before_bws;
+        if (s[*pos] != ';') return false;
+        (*pos)++;
+
+        skip_http_bws(s, len, pos);
+        size_t name_start = *pos;
+        while (*pos < len && http_is_token_char((unsigned char)s[*pos])) (*pos)++;
+        if (*pos == name_start) return false;
+
+        skip_http_bws(s, len, pos);
+        if (*pos < len && s[*pos] == '=') {
+            (*pos)++;
+            skip_http_bws(s, len, pos);
+            if (*pos < len && s[*pos] == '"') {
+                if (!parse_http_quoted_string(s, len, pos)) return false;
+            } else {
+                size_t value_start = *pos;
+                while (*pos < len && http_is_token_char((unsigned char)s[*pos])) (*pos)++;
+                if (*pos == value_start) return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool parse_chunk_size_line(const char *line, size_t len,
+                                  size_t max_size, size_t *chunk_size) {
+    size_t pos = 0;
+    size_t value = 0;
+    size_t digits = 0;
+    while (pos < len) {
+        unsigned char c = (unsigned char)line[pos];
+        size_t digit;
+        if (c >= '0' && c <= '9') digit = (size_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (size_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') digit = (size_t)(c - 'A' + 10);
+        else break;
+        if (value > (max_size - digit) / 16) return false;
+        value = value * 16 + digit;
+        pos++;
+        digits++;
+    }
+    if (digits == 0 || !parse_chunk_extensions(line, len, &pos)) return false;
+    *chunk_size = value;
+    return true;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -17383,23 +17472,17 @@ static bool read_http_request(int fd, http_request *r) {
                 }
             }
 
-            /* Parse the hex chunk size 'val' using strtol on the line */
+            /* Parse strict 1*HEXDIG chunk-size syntax and valid extensions. */
             const char *line_start = b.ptr + src_pos;
-            char *ep;
-            char hex_buf[128];
             size_t line_len = line_end - src_pos;
-            if (line_len >= sizeof(hex_buf)) {
+            size_t chunk_size;
+            if (line_len && line_start[line_len - 1] == '\r') line_len--;
+            if (line_len >= 128 ||
+                !parse_chunk_size_line(line_start, line_len, max_body, &chunk_size)) {
                 buf_free(&decoded);
                 goto fail;
             }
-            memcpy(hex_buf, line_start, line_len);
-            hex_buf[line_len] = '\0';
-
-            long val = strtol(hex_buf, &ep, 16);
-            if (ep == hex_buf || !(*ep == '\0' || *ep == '\r' || *ep == ';') || val < 0 || val > 64 * 1024 * 1024) {
-                buf_free(&decoded);
-                goto fail;
-            }
+            size_t val = chunk_size;
 
             /* Move src_pos past the chunk size line */
             src_pos = line_end + 1;
@@ -28548,8 +28631,8 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
     const char *valid =
         "POST /v1/chat/completions HTTP/1.1\r\n"
         "Transfer-Encoding: \tChUnKeD \t\r\n\r\n"
-        "4;note=yes\r\nWiki\r\n5\r\npedia\r\n"
-        "0\r\nX-Trailer: ignored\r\n\r\n";
+        "2\r\nWi\r\n2; note = \"some;thing\"\r\nki\r\n"
+        "5;note=yes\r\npedia\r\n0\r\nX-Trailer: ignored\r\n\r\n";
     http_request req = {0};
     bool parsed = parse_http_test_request(valid, &req);
     TEST_ASSERT(parsed);
@@ -28569,6 +28652,16 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
         "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\rX\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "+1\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0x1\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1;=broken\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1;note=\"unterminated\r\nA\r\n0\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         TEST_ASSERT(http_test_client_rejects_and_closes(invalid[i]));
