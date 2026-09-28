@@ -17327,6 +17327,40 @@ static bool http_is_token_char(unsigned char c) {
     }
 }
 
+static bool http_request_header_fields_valid(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+
+    /* Skip the request line; this check is specifically for field syntax. */
+    while (p < end && *p != '\n') p++;
+    if (p == end) return false;
+    p++;
+
+    for (;;) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        if (p == end) return false;
+
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len == 0) return p + 1 == end;
+
+        size_t colon = 0;
+        while (colon < len && line[colon] != ':') colon++;
+        if (colon == 0 || colon == len) return false;
+        for (size_t i = 0; i < colon; i++) {
+            if (!http_is_token_char((unsigned char)line[i])) return false;
+        }
+
+        /* Field values permit HTAB, visible bytes, and obs-text, but no other
+         * controls. In particular, stray CR cannot be hidden before a colon. */
+        for (size_t i = colon + 1; i < len; i++) {
+            unsigned char c = (unsigned char)line[i];
+            if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+        }
+        p++;
+    }
+}
+
 static void skip_http_bws(const char *s, size_t len, size_t *pos) {
     while (*pos < len && (s[*pos] == ' ' || s[*pos] == '\t')) (*pos)++;
 }
@@ -17418,6 +17452,7 @@ static bool read_http_request(int fd, http_request *r) {
         hend = header_end(b.ptr, b.len);
     }
     if (hend < 0) goto fail;
+    if (!http_request_header_fields_valid(b.ptr, (size_t)hend)) goto fail;
 
     char line[512];
     size_t i = 0;
@@ -28684,6 +28719,18 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
     }
     http_request_free(&req);
 
+    const char *content_length_ows =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Content-Length: \t1\t\r\n\r\nA";
+    memset(&req, 0, sizeof(req));
+    parsed = parse_http_test_request(content_length_ows, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == 1);
+        TEST_ASSERT(req.body[0] == 'A');
+    }
+    http_request_free(&req);
+
     /* Split every byte of the size lines, extensions, payload, data CRLF,
      * zero chunk, and trailers across independent writes. The parser must not
      * depend on how recv() groups bytes. */
@@ -28728,6 +28775,16 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
         "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        /* Whitespace before the colon is never OWS in the value: it makes the
+         * field-name invalid and must not hide CL from the TE/CL conflict. */
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Length : 0\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nContent-Length: 0\r\n"
+        "Transfer-Encoding : chunked\r\n\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nBad Header: value\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nContent-Length\001: 0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nX-Test: value\001\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "1\rX\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
