@@ -17517,9 +17517,11 @@ static bool read_http_request(int fd, http_request *r) {
                         }
                     }
                     size_t trailer_len = trailer_end - src_pos;
-                    if (trailer_len && b.ptr[trailer_end - 1] == '\r') {
-                        trailer_len--;
+                    if (!trailer_len || b.ptr[trailer_end - 1] != '\r') {
+                        buf_free(&decoded);
+                        goto fail;
                     }
+                    trailer_len--;
                     src_pos = trailer_end + 1;
                     if (trailer_len == 0) {
                         break; /* Empty line found; trailer section is fully consumed */
@@ -28632,6 +28634,8 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "1\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "1\r\nA\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\nX-Trailer: ignored\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "+1\r\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
