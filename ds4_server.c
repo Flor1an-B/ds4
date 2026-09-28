@@ -28548,6 +28548,49 @@ static bool parse_http_test_request(const char *raw, http_request *r) {
     return ok;
 }
 
+typedef struct {
+    int fd;
+    const char *raw;
+    size_t len;
+    bool sent_all;
+} http_fragmented_write_arg;
+
+static void *http_fragmented_write_main(void *arg) {
+    http_fragmented_write_arg *wa = arg;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000};
+    size_t sent = 0;
+    while (sent < wa->len) {
+        ssize_t n = write(wa->fd, wa->raw + sent, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NULL;
+        sent += (size_t)n;
+        struct timespec remaining = pause;
+        while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
+    }
+    wa->sent_all = shutdown(wa->fd, SHUT_WR) == 0;
+    return NULL;
+}
+
+static bool parse_http_test_request_one_byte_chunks(const char *raw,
+                                                    http_request *r) {
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    http_fragmented_write_arg wa = {
+        .fd = sv[1], .raw = raw, .len = strlen(raw), .sent_all = false,
+    };
+    pthread_t writer;
+    if (pthread_create(&writer, NULL, http_fragmented_write_main, &wa) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+    bool parsed = read_http_request(sv[0], r);
+    pthread_join(writer, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    return parsed && wa.sent_all;
+}
+
 static bool http_test_client_rejects_and_closes(const char *raw) {
     int sv[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
@@ -28604,6 +28647,29 @@ static bool http_test_client_rejects_and_closes(const char *raw) {
     }
 
 static void test_http_transfer_encoding_accepts_only_supported_single_chunked(void) {
+    const size_t max_body = 64u * 1024u * 1024u;
+    size_t parsed_chunk_size = 0;
+    TEST_ASSERT(parse_chunk_size_line("4000000", 7, max_body,
+                                     &parsed_chunk_size));
+    TEST_ASSERT(parsed_chunk_size == max_body);
+    TEST_ASSERT(!parse_chunk_size_line("4000001", 7, max_body,
+                                      &parsed_chunk_size));
+
+    char size_t_max_hex[2 * sizeof(size_t) + 1];
+    memset(size_t_max_hex, 'F', sizeof(size_t_max_hex) - 1);
+    size_t_max_hex[sizeof(size_t_max_hex) - 1] = '\0';
+    TEST_ASSERT(parse_chunk_size_line(size_t_max_hex,
+                                      sizeof(size_t_max_hex) - 1,
+                                      SIZE_MAX, &parsed_chunk_size));
+    TEST_ASSERT(parsed_chunk_size == SIZE_MAX);
+    char overflowing_hex[sizeof(size_t_max_hex) + 1];
+    memcpy(overflowing_hex, size_t_max_hex, sizeof(size_t_max_hex) - 1);
+    overflowing_hex[sizeof(size_t_max_hex) - 1] = 'F';
+    overflowing_hex[sizeof(size_t_max_hex)] = '\0';
+    TEST_ASSERT(!parse_chunk_size_line(overflowing_hex,
+                                       sizeof(overflowing_hex) - 1,
+                                       SIZE_MAX, &parsed_chunk_size));
+
     const char *valid =
         "POST /v1/chat/completions HTTP/1.1\r\n"
         "Transfer-Encoding: \tChUnKeD \t\r\n\r\n"
@@ -28615,6 +28681,40 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
     if (parsed) {
         TEST_ASSERT(req.body_len == strlen("Wikipedia"));
         TEST_ASSERT(memcmp(req.body, "Wikipedia", strlen("Wikipedia")) == 0);
+    }
+    http_request_free(&req);
+
+    /* Split every byte of the size lines, extensions, payload, data CRLF,
+     * zero chunk, and trailers across independent writes. The parser must not
+     * depend on how recv() groups bytes. */
+    const char *fragmented =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n"
+        "1;note=\"a\\\"b\"\r\nA\r\n"
+        "2;flag=yes\r\nBC\r\n"
+        "0;done\r\nX-Trailer: ignored\r\n\r\n";
+    memset(&req, 0, sizeof(req));
+    parsed = parse_http_test_request_one_byte_chunks(fragmented, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == 3);
+        TEST_ASSERT(memcmp(req.body, "ABC", 3) == 0);
+    }
+    http_request_free(&req);
+
+    /* The server is deliberately one-request-per-connection and discards
+     * pipelined bytes. They must not be folded into the decoded request body. */
+    const char *trailing =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA\r\n0\r\n\r\n"
+        "GET /v1/models HTTP/1.1\r\n\r\n";
+    memset(&req, 0, sizeof(req));
+    parsed = parse_http_test_request(trailing, &req);
+    TEST_ASSERT(parsed);
+    if (parsed) {
+        TEST_ASSERT(req.body_len == 1);
+        TEST_ASSERT(req.body[0] == 'A');
     }
     http_request_free(&req);
 
@@ -28635,6 +28735,8 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "1\r\nA\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA\rX",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "0\r\nX-Trailer: ignored\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "+1\r\nA\r\n0\r\n\r\n",
@@ -28644,6 +28746,16 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "1;=broken\r\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "1;note=\"unterminated\r\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4000001\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\nX-Trailer: value\r\n",
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         TEST_ASSERT(http_test_client_rejects_and_closes(invalid[i]));
