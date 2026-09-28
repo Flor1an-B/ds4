@@ -17537,8 +17537,8 @@ static bool read_http_request(int fd, http_request *r) {
                 goto have_body;
             }
 
-            /* Read from fd until we have at least val + 1 bytes in the buffer after src_pos */
-            while (b.len < src_pos + (size_t)val + 1) {
+            /* Each chunk-data payload must be followed by exact CRLF. */
+            while (b.len < src_pos + (size_t)val + 2) {
                 char tmp[4096];
                 ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
                 if (n < 0 && errno == EINTR) continue;
@@ -17553,30 +17553,8 @@ static bool read_http_request(int fd, http_request *r) {
                 }
             }
 
-            /* Detect terminator length: 2 bytes if CRLF, 1 byte if LF */
-            size_t term_len = (b.ptr[src_pos + (size_t)val] == '\r') ? 2 : 1;
-
-            /* Read until the entire terminator is in the buffer */
-            while (b.len < src_pos + (size_t)val + term_len) {
-                char tmp[4096];
-                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) {
-                    buf_free(&decoded);
-                    goto fail;
-                }
-                buf_append(&b, tmp, (size_t)n);
-                if (b.len - (size_t)hend > max_body) {
-                    buf_free(&decoded);
-                    goto fail;
-                }
-            }
-
-            if (term_len == 2 && b.ptr[src_pos + (size_t)val + 1] != '\n') {
-                buf_free(&decoded);
-                goto fail;
-            }
-            if (term_len == 1 && b.ptr[src_pos + (size_t)val] != '\n') {
+            if (b.ptr[src_pos + (size_t)val] != '\r' ||
+                b.ptr[src_pos + (size_t)val + 1] != '\n') {
                 buf_free(&decoded);
                 goto fail;
             }
@@ -17584,16 +17562,8 @@ static bool read_http_request(int fd, http_request *r) {
             /* Append the val bytes of chunk data to decoded */
             buf_append(&decoded, b.ptr + src_pos, (size_t)val);
 
-            /* Move src_pos past the chunk data */
-            src_pos += (size_t)val;
-
-            /* Skip the chunk terminator (\r\n or \n) */
-            if (src_pos < b.len && b.ptr[src_pos] == '\r') {
-                src_pos++;
-            }
-            if (src_pos < b.len && b.ptr[src_pos] == '\n') {
-                src_pos++;
-            }
+            /* Move src_pos past the chunk data and its CRLF terminator. */
+            src_pos += (size_t)val + 2;
         }
     }
 
@@ -28660,6 +28630,8 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
         "1\rX\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "1\nA\r\n0\r\n\r\n",
+        "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1\r\nA\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
         "+1\r\nA\r\n0\r\n\r\n",
         "GET /not-found HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
