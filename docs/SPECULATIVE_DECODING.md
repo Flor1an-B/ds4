@@ -45,6 +45,28 @@ Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
 For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
+## DSpark: consecutive-reject backoff
+
+The shared scheduler pauses drafting after rejected proposals: the first
+consecutive miss is left unpunished (an echoed pattern usually re-locks on
+the very next proposal), and further consecutive misses double the pause
+(2, 4, 8 ... up to 64 cycles) so rejection-heavy passages decode at full
+speed instead of paying a batched verify per miss, while any accepted draft
+restores drafting immediately.
+`DS4_DSPARK_SCHEDULER_EXP_BACKOFF_BASE=0` restores the older flat pauses
+only, `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CAP` bounds the longest pause, and
+`DS4_DSPARK_SCHEDULER_EXP_BACKOFF_MIN_STREAK=1` also pauses after a single
+miss.
+
+Accepted cycles also accrue credit (one per accept, two for a full-width
+accept, up to `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CREDIT`, default 16): a
+rejected proposal spends one credit instead of growing the miss streak, so
+a long high-acceptance stretch keeps drafting through its isolated misses —
+pausing there would only shift the drafting phase out of the repeating
+pattern — while a genuinely dead passage still reaches the exponential
+ladder once the saved credit runs out. `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CREDIT=0`
+disables credit and keeps the bare miss-streak ladder.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:

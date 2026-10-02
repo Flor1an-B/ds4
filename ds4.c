@@ -60759,6 +60759,9 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t draft_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t accepted_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t scheduler_skips;
+    uint64_t scheduler_rejections;
+    uint64_t scheduler_exp_pauses;
+    uint64_t scheduler_credit_misses;
     uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
@@ -60877,6 +60880,8 @@ struct ds4_session {
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
     uint32_t dspark_sched_skip;
+    uint32_t dspark_sched_miss_streak;
+    uint32_t dspark_sched_credit;
     uint32_t dspark_sched_lifetime_accepted;
     double dspark_sched_life_extra_ms;
     double dspark_sched_life_saved_ms;
@@ -61062,6 +61067,57 @@ static float ds4_dspark_scheduler_cold_low_confidence_threshold(void) {
     return (float)ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI", 500) / 1000.0f;
 }
 
+/* A rejected proposal pays a full batched verify, so consecutive misses
+ * deserve a pause that doubles until a fresh accept proves the region
+ * speculative again.  Base 0 disables the backoff and keeps the legacy
+ * flat pauses only; the cap bounds how far a streak can silence drafting. */
+static uint32_t ds4_dspark_scheduler_exp_backoff_base(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_BASE", 2);
+}
+
+static uint32_t ds4_dspark_scheduler_exp_backoff_cap(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CAP", 64);
+}
+
+/* The first miss is free: a periodic echo re-locks on the very next
+ * proposal (redrafting after a miss still accepts), so pausing on a
+ * single miss only forfeits echo cycles.  Only consecutive misses are
+ * evidence of a rejection-heavy region, and min_streak=1 restores the
+ * pause-after-every-miss ladder. */
+static uint32_t ds4_dspark_scheduler_exp_backoff_min_streak(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_MIN_STREAK", 2);
+}
+
+/* Accepted cycles accrue credit and rejected cycles spend it before the
+ * exponential ladder engages: after a long high-acceptance run, isolated
+ * misses are absorbed instead of shifting the drafting phase (a periodic
+ * echo re-locks only if drafting continues right past a miss).  The cap
+ * bounds how long a stale credit can mask a genuinely dead region.  0
+ * disables credit and keeps the bare miss-streak ladder. */
+static uint32_t ds4_dspark_scheduler_exp_backoff_credit_cap(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CREDIT", 16);
+}
+
+static uint32_t ds4_dspark_scheduler_exp_backoff_pause(uint32_t streak) {
+    const uint32_t min_streak = ds4_dspark_scheduler_exp_backoff_min_streak();
+    if (streak < min_streak || min_streak == 0) return 0;
+    const uint32_t base = ds4_dspark_scheduler_exp_backoff_base();
+    if (base == 0) return 0;
+    const uint32_t cap = ds4_dspark_scheduler_exp_backoff_cap();
+    /* Double one shift at a time so an oversized knob saturates at the
+     * cap instead of wrapping the pause back to zero. */
+    uint32_t pause = base;
+    for (uint32_t shift = min_streak; shift < streak && pause < cap; shift++) {
+        if (pause > cap / 2u) {
+            pause = cap;
+            break;
+        }
+        pause *= 2u;
+    }
+    if (pause > cap) pause = cap;
+    return pause;
+}
+
 /* Timing-sensitive scheduling changes which arithmetic path advances a token.
  * Keep it opt-in so greedy DSpark output is reproducible across runs. */
 static bool ds4_dspark_scheduler_timing_enabled(void) {
@@ -61082,6 +61138,8 @@ static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     if (!s) return;
     ds4_session_dspark_scheduler_reset(s);
     s->dspark_sched_skip = 0;
+    s->dspark_sched_miss_streak = 0;
+    s->dspark_sched_credit = 0;
     s->dspark_sched_lifetime_accepted = 0;
     s->dspark_sched_life_extra_ms = 0.0;
     s->dspark_sched_life_saved_ms = 0.0;
@@ -61135,6 +61193,63 @@ static void ds4_session_dspark_scheduler_note(
         }
     }
     if (no_draft) s->dspark_sched_no_draft++;
+    /* Miss-streak backoff: only a cycle that proposed drafts and lost the
+     * verification grows the streak.  No-draft cycles keep their fixed
+     * pause (the context scan is nearly free) and skipped cycles return
+     * early above, so the streak tracks real rejected verifies.  Any
+     * accept clears it, letting a high-acceptance region draft again on
+     * the very next cycle. */
+    if (accepted_drafts != 0) {
+        s->dspark_sched_miss_streak = 0;
+        const uint32_t credit_cap =
+            ds4_dspark_scheduler_exp_backoff_credit_cap();
+        if (credit_cap != 0) {
+            uint32_t credit = s->dspark_sched_credit + 1u;
+            if (accepted_drafts >= 4u) credit += 1u;
+            if (credit > credit_cap) credit = credit_cap;
+            s->dspark_sched_credit = credit;
+        }
+    } else if (!no_draft) {
+        const uint32_t credit_cap =
+            ds4_dspark_scheduler_exp_backoff_credit_cap();
+        if (credit_cap != 0 && s->dspark_sched_credit > 0) {
+            /* Spend credit instead of growing the streak: the miss is
+             * absorbed and drafting continues on the next cycle, which
+             * is what a high-acceptance region needs to keep its phase. */
+            s->dspark_sched_credit--;
+            if (ds4_dspark_stats_enabled()) {
+                s->dspark_stats.scheduler_rejections++;
+                s->dspark_stats.scheduler_credit_misses++;
+            }
+            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                fprintf(stderr,
+                        "ds4: DSpark scheduler credit miss=%u streak=%u\n",
+                        s->dspark_sched_credit,
+                        s->dspark_sched_miss_streak);
+            }
+        } else {
+        s->dspark_sched_miss_streak++;
+        if (ds4_dspark_stats_enabled()) {
+            s->dspark_stats.scheduler_rejections++;
+        }
+        const uint32_t exp_pause = ds4_dspark_scheduler_exp_backoff_pause(
+                s->dspark_sched_miss_streak);
+        if (exp_pause > s->dspark_sched_skip) {
+            s->dspark_sched_skip = exp_pause;
+            if (ds4_dspark_stats_enabled()) {
+                s->dspark_stats.scheduler_exp_pauses++;
+            }
+            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+                fprintf(stderr,
+                        "ds4: DSpark scheduler exp-backoff streak=%u "
+                        "pause=%u credit=%u\n",
+                        s->dspark_sched_miss_streak,
+                        s->dspark_sched_skip,
+                        s->dspark_sched_credit);
+            }
+        }
+        }
+    }
     if (extra_ms > 0.0 && isfinite(extra_ms)) {
         s->dspark_sched_extra_ms += extra_ms;
     }
@@ -61169,6 +61284,13 @@ static void ds4_session_dspark_scheduler_note(
         if (s->dspark_sched_skip < skip) {
             s->dspark_sched_skip = skip;
         }
+        /* The streak is not evidence about this cycle; a no-draft pause
+         * still may not shorten the pause the streak already earned. */
+        const uint32_t exp_floor = ds4_dspark_scheduler_exp_backoff_pause(
+                s->dspark_sched_miss_streak);
+        if (s->dspark_sched_skip < exp_floor) {
+            s->dspark_sched_skip = exp_floor;
+        }
         if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
                     "ds4: DSpark scheduler no-draft pause skip=%u "
@@ -61199,6 +61321,13 @@ static void ds4_session_dspark_scheduler_note(
         s->dspark_sched_cycles >= break_even_window &&
         measured_unprofitable) {
         s->dspark_sched_skip = ds4_dspark_scheduler_slow_skip_cycles();
+        /* The miss-streak backoff is a floor: a flat pause never shortens
+         * a pause the streak already earned. */
+        const uint32_t exp_floor = ds4_dspark_scheduler_exp_backoff_pause(
+                s->dspark_sched_miss_streak);
+        if (s->dspark_sched_skip < exp_floor) {
+            s->dspark_sched_skip = exp_floor;
+        }
         if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
                     "ds4: DSpark scheduler break-even pause cycles=%u "
@@ -61253,6 +61382,13 @@ static void ds4_session_dspark_scheduler_note(
             if (s->dspark_sched_skip < slow_skip) {
                 s->dspark_sched_skip = slow_skip;
             }
+        }
+        /* Same floor as the break-even pause above: the windowed flat
+         * pause may extend the streak's pause, never cut it short. */
+        const uint32_t exp_floor = ds4_dspark_scheduler_exp_backoff_pause(
+                s->dspark_sched_miss_streak);
+        if (s->dspark_sched_skip < exp_floor) {
+            s->dspark_sched_skip = exp_floor;
         }
         if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
@@ -73390,6 +73526,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "full=%llu partial=%llu direct_full=%llu direct_partial=%llu "
             "replay_fallbacks=%llu miss_first=%llu no_draft=%llu "
             "no_room=%llu invalid=%llu scheduler_skips=%llu "
+            "rejections=%llu exp_pauses=%llu credit_misses=%llu "
             "tail_skips=%llu verifier_unavailable=%llu errors=%llu time_ms propose=%.3f "
             "prop_stage0=%.3f prop_setup=%.3f prop_cache=%.3f "
             "prop_chain=%.3f prop_hidden=%.3f prop_conf0=%.3f "
@@ -73416,6 +73553,9 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             (unsigned long long)st->no_room,
             (unsigned long long)st->invalid_draft,
             (unsigned long long)st->scheduler_skips,
+            (unsigned long long)st->scheduler_rejections,
+            (unsigned long long)st->scheduler_exp_pauses,
+            (unsigned long long)st->scheduler_credit_misses,
             (unsigned long long)st->tail_skips,
             (unsigned long long)st->verifier_unavailable,
             (unsigned long long)st->verifier_errors,
