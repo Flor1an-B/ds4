@@ -60697,6 +60697,17 @@ struct ds4_session {
     uint32_t qwen4_depth_cycles;
     uint32_t qwen4_reject2_streak;   /* consecutive 3-row cycles whose second draft rejected */
     bool qwen4_depth3_engaged;
+    /* Exact sampled MTP draws the next token inside the cycle, so the pending
+     * draft is conditioned on the token that will be emitted (not on the
+     * argmax), and a rejected draft's residual sample enters the next verify
+     * instead of a one-row replay.  ds4_session_sample hands the held token
+     * back when asked at the same position with the same sampler. */
+    int qwen4_next_token;
+    uint32_t qwen4_next_pos;         /* checkpoint length it was drawn at; 0 = none */
+    float qwen4_next_temperature;
+    float qwen4_next_top_p;
+    float qwen4_next_min_p;
+    int qwen4_next_top_k;
     bool glm_mtp_rollback_valid;
     uint32_t glm_mtp_rollback_pos;
     uint32_t glm_mtp_rollback_dense_len;
@@ -74548,18 +74559,6 @@ static bool qwen4_spec_force_accept(void) {
     return getenv("DS4_QWEN4_SPEC_FORCE_ACCEPT") != NULL;
 }
 
-/* draft the token after `parent` from row `row` of the last forward, at idx */
-static void qwen4_session_draft(ds4_session *s, uint32_t row, int parent, uint32_t idx) {
-    int d = -1;
-    s->glm_mtp_have = 0;
-    if (qwen4_graph_mtp_step(&s->qwen4_graph, &s->engine->model, &s->engine->weights,
-                             row, parent, idx, true, NULL, &d)) {
-        s->glm_mtp_draft = d;
-        s->glm_mtp_parent = parent;
-        s->glm_mtp_have = 1;
-    }
-}
-
 /* Draft depth policy for the Qwen3.8 cycle: DS4_QWEN4_MTP_DEPTH=2 or =3
  * forces a fixed depth (read per cycle so the A/B harnesses can switch it
  * per step); 0/auto, the default, drafts two tokens while the rolling
@@ -74594,12 +74593,45 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
     if (accepted_first) s->qwen4_depth_accepted++;
 }
 
+/* hold `token` as the next sample at the current position (ds4_session_sample) */
+static void qwen4_spec_hold_next(ds4_session *s, int token, float temperature, int top_k,
+                                 float top_p, float min_p) {
+    s->qwen4_next_token = token;
+    s->qwen4_next_pos = (uint32_t)s->checkpoint.len;
+    s->qwen4_next_temperature = temperature;
+    s->qwen4_next_top_k = top_k;
+    s->qwen4_next_top_p = top_p;
+    s->qwen4_next_min_p = min_p;
+}
+
+/* Parent of the next pending draft.  Exact sampling draws the real next token
+ * from s->logits now (same sampler, held for ds4_session_sample), so the draft
+ * survives whenever the sample is not the argmax; greedy and opportunistic
+ * decoding emit the argmax anyway. */
+static int qwen4_spec_next_parent(ds4_session *s, bool exact, float temperature, int top_k,
+                                  float top_p, float min_p, uint64_t *rng) {
+    if (exact) {
+        if (!s->sample_probs) s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        const int t = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+                                         top_p, min_p, rng, s->sample_probs);
+        if (t >= 0) {
+            qwen4_spec_hold_next(s, t, temperature, top_k, top_p, min_p);
+            return t;
+        }
+    }
+    return sample_argmax(s->logits, DS4_N_VOCAB);
+}
+
 /* One Qwen3.8 MTP cycle: evaluate first_token, or verify [first_token, draft]
  * — plus a second chained draft when the depth policy engages it — in one
  * 2- or 3-row pass.  Greedy and opportunistic sampling accept a draft when
- * it is the target argmax; exact sampling treats it as a point-mass proposal
- * (accept with p(draft), else replay a residual sample) and always runs at
- * depth 2. */
+ * it is the target argmax.  Exact sampling treats each draft as a point-mass
+ * proposal, position by position: accept draft i with p_i(draft_i), else
+ * emit a residual sample of p_i without it and stop; when every draft is
+ * accepted the next token is drawn from the last row.  The residual or next
+ * sample is held for ds4_session_sample and becomes the next cycle's
+ * first_token, so it is verified together with a fresh draft instead of
+ * being replayed alone. */
 static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
                                         int *accepted, int accepted_cap,
@@ -74611,8 +74643,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     if (qwen4_session_replay_if_stale(s, err, errlen) != 0) return -1;
     const uint32_t pos = g->pos;
     const uint32_t V = DS4_N_VOCAB;
-    const int depth = (exact_sampling && temperature > 0.0f) || getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL
-        ? 2 : qwen4_spec_depth(s);
+    const bool exact = exact_sampling && temperature > 0.0f;
+    const int depth = getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL ? 2 : qwen4_spec_depth(s);
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u) {
@@ -74627,7 +74659,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = qwen4_spec_next_parent(s, exact, temperature, top_k, top_p, min_p, rng);
         int draft = -1;
         s->glm_mtp_have2 = false;
         if (qwen4_graph_mtp_step(&s->qwen4_graph, m, w, 0, parent, pos, true, NULL, &draft)) {
@@ -74696,21 +74728,31 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     if (deep) {
         accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
     }
+    /* exact: residual sample at the first rejected position (row 0 for the
+     * first draft, row 1 for the second) */
     int replacement = -1;
-    if (exact_sampling && temperature > 0.0f) {
+    if (exact) {
         if (!s->sample_probs) s->sample_probs = xmalloc((size_t)V * sizeof(s->sample_probs[0]));
-        if (!rng || !sample_build_probabilities(rows, V, temperature, top_k, top_p, min_p, s->sample_probs)) {
-            if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: target distribution failed");
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        accept = speculative_point_accept(s->sample_probs[d], 1.0f, rng);
-        if (!accept) {
-            replacement = speculative_point_replacement(s, d, rng);
-            if (replacement < 0) {
-                if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: replacement sampling failed");
+        accept2 = false;   /* the argmax verdicts above do not apply */
+        for (uint32_t r = 0; r + 1u < T; r++) {
+            const int draft_r = toks[r + 1u];
+            if (!rng || !sample_build_probabilities(rows + (size_t)r * V, V, temperature, top_k,
+                                                    top_p, min_p, s->sample_probs)) {
+                if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: target distribution failed");
                 s->checkpoint_valid = false;
                 return -1;
+            }
+            const bool ok_r = speculative_point_accept(s->sample_probs[draft_r], 1.0f, rng);
+            if (r == 0) accept = ok_r;
+            else accept2 = ok_r;
+            if (!ok_r) {
+                replacement = speculative_point_replacement(s, draft_r, rng);
+                if (replacement < 0) {
+                    if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: replacement sampling failed");
+                    s->checkpoint_valid = false;
+                    return -1;
+                }
+                break;
             }
         }
     }
@@ -74727,7 +74769,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         token_vec_push(&s->checkpoint, d);
         if (deep) token_vec_push(&s->checkpoint, d2);
         memcpy(s->logits, rows + (T - 1u) * V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = qwen4_spec_next_parent(s, exact, temperature, top_k, top_p, min_p, rng);
         bool have_next = false;
         int draft = -1;
         if (deep) {
@@ -74771,7 +74813,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         s->checkpoint.len = pos + 1;
         token_vec_push(&s->checkpoint, d);
         memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
-        const int parent = sample_argmax(s->logits, V);
+        /* exact: the second draft's residual sample is the next token */
+        if (replacement >= 0) qwen4_spec_hold_next(s, replacement, temperature, top_k, top_p, min_p);
+        const int parent = replacement >= 0 ? replacement : sample_argmax(s->logits, V);
         const int next_tokens[2] = {d, parent};
         int draft = -1;
         if (qwen4_graph_mtp_steps(g, m, w, 0, next_tokens, 2u, pos, true, NULL, &draft)) {
@@ -74796,22 +74840,12 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         s->checkpoint_valid = false;
         return -1;
     }
-    if (replacement >= 0) {
-        /* the residual sample stands in for the draft: run it from the restored state */
-        if (!qwen4_graph_forward_tokens(g, m, w, &replacement, 1, s->logits, false)) {
-            if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: replacement replay failed");
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        token_vec_push(&s->checkpoint, replacement);
-        qwen4_session_draft(s, 0, sample_argmax(s->logits, V), pos + 1u);
-        accepted[0] = first_token;
-        accepted[1] = replacement;
-        return 2;
-    }
     memcpy(s->logits, rows, (size_t)V * sizeof(float));
+    /* exact: the first draft's residual sample is the next token; it opens the
+     * next cycle's verify with a draft conditioned on it (no one-row replay) */
+    if (replacement >= 0) qwen4_spec_hold_next(s, replacement, temperature, top_k, top_p, min_p);
     {
-        const int parent = sample_argmax(s->logits, V);
+        const int parent = replacement >= 0 ? replacement : sample_argmax(s->logits, V);
         int draft = -1;
         if (qwen4_graph_mtp_step(g, m, w, 0, parent, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
@@ -77044,6 +77078,17 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifndef DS4_NO_GPU
+    /* a token the exact MTP cycle already drew from these logits with this
+     * sampler (see qwen4_next_token): the same distribution, one call earlier */
+    const uint32_t held_at = s->qwen4_next_pos;
+    s->qwen4_next_pos = 0;
+    if (held_at != 0 && held_at == (uint32_t)s->checkpoint.len &&
+        temperature == s->qwen4_next_temperature && top_k == s->qwen4_next_top_k &&
+        top_p == s->qwen4_next_top_p && min_p == s->qwen4_next_min_p) {
+        return s->qwen4_next_token;
+    }
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
