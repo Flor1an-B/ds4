@@ -12126,7 +12126,7 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     char *visible = kv_cache_visible_prefix_text(s, slot, tokens, target, &ext, &key);
     const bool stored = visible
         ? kv_cache_store_live_prefix_text(s, slot, tokens, target, "continued",
-                                          visible, ext, key)
+                                          visible, ext, key, NULL)
         : kv_cache_store_live_prefix(s, slot, tokens, target, "continued");
     free(visible);
     if (stored) {
