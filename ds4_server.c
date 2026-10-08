@@ -9973,6 +9973,12 @@ static bool visible_image_prefix_matches(const visible_image_key *incoming,
            incoming->offsets[old->count] >= boundary;
 }
 
+/* Transient client metadata spans (<environment_details>, <system-reminder>)
+ * are defined next to the visible-key helpers they normalize. */
+static char *strip_transient_blocks(const char *text);
+static bool stripped_prefix_raw_offset(const char *text, size_t target,
+                                       size_t *raw_off);
+
 typedef struct {
     bool valid;
     /* Token frontier of a live assistant tool-call turn. Continuing from this
@@ -10484,11 +10490,21 @@ static void thinking_live_clear(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text, const request *req) {
-    if (!s || !slot || !visible_text || !visible_text[0]) return;
+/* Arm the visible-key tier on the current live frontier and return the key
+ * length actually stored (0 when the key could not be built).
+ *
+ * The key is normalized to the transient-stripped rendering, and
+ * slot_probe_reuse_locked() normalizes the incoming prompt the same way.  A
+ * client that rebuilds the next request without <environment_details> /
+ * <system-reminder> spans and one that replays those spans verbatim therefore
+ * bind to the same frontier, instead of only the first kind ever matching. */
+static size_t thinking_live_remember(server *s, server_slot *slot,
+                                     const char *visible_text, const request *req) {
+    if (!s || !slot || !visible_text || !visible_text[0]) return 0;
+    char *stripped = strip_transient_blocks(visible_text);
     visible_image_key images;
-    char *key = visible_prompt_key(req, visible_text, &images);
+    char *key = visible_prompt_key(req, stripped ? stripped : visible_text,
+                                   &images);
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
     slot->thinking_live.visible_text = key;
@@ -10496,7 +10512,10 @@ static void thinking_live_remember(server *s, server_slot *slot,
     slot->thinking_live.images = images;
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
     slot->thinking_live.valid = key != NULL;
+    const size_t key_len = slot->thinking_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
+    free(stripped);
+    return key_len;
 }
 
 static void responses_live_remember(server *s, server_slot *slot,
@@ -11687,9 +11706,16 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
+    /* Both sides are compared in transient-stripped space: the key is stored
+     * that way, so a client that replays <environment_details> /
+     * <system-reminder> spans verbatim and one that rebuilds the next request
+     * without them bind to the same key, instead of only the second kind ever
+     * matching. */
     if (req->kind == REQ_CHAT && req->api != API_RESPONSES && ptext) {
+        char *stripped = strip_transient_blocks(ptext);
         visible_image_key vimages;
-        char *vkey = visible_prompt_key(req, ptext, &vimages);
+        char *vkey = visible_prompt_key(req, stripped ? stripped : ptext,
+                                        &vimages);
         if (vkey) {
             size_t vlen = strlen(vkey);
             bool ok = slot->thinking_live.valid &&
@@ -11702,15 +11728,24 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                       byte_prefix_match(vkey, vlen,
                           slot->thinking_live.visible_text,
                           slot->thinking_live.visible_len);
+            /* The key length lives in stripped space; the suffix is cut from
+             * the raw text, so map it back before trusting it. */
+            size_t suffix_off = slot->thinking_live.visible_len;
+            if (ok && stripped)
+                ok = stripped_prefix_raw_offset(ptext,
+                                                slot->thinking_live.visible_len,
+                                                &suffix_off);
             if (ok) {
                 pr.kind = REUSE_THINKING_VISIBLE;
                 pr.reuse_tokens = live_pos;
-                pr.suffix_off = slot->thinking_live.visible_len;
+                pr.suffix_off = suffix_off;
                 free(vkey);
+                free(stripped);
                 return pr;
             }
             free(vkey);
         }
+        free(stripped);
     }
 
     if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
@@ -12860,6 +12895,27 @@ static const char * const transient_block_tags[] = {
     "system-reminder",          /* OpenCode / Claude Code injected notes */
 };
 
+/* When `open` points at the '<' that starts one of the transient block tags,
+ * return the offset just past its closing tag; NULL for ordinary text and for
+ * an unterminated block (a wrong guess only produces a key that never
+ * matches). */
+static const char *transient_block_end(const char *open) {
+    if (!open || *open != '<') return NULL;
+    for (size_t t = 0; t < sizeof(transient_block_tags) /
+                           sizeof(transient_block_tags[0]); t++)
+    {
+        const char *tag = transient_block_tags[t];
+        const size_t tag_len = strlen(tag);
+        if (strncmp(open + 1, tag, tag_len) || open[1 + tag_len] != '>')
+            continue;
+        char end_tag[64];
+        snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
+        const char *end = strstr(open + 1 + tag_len + 1, end_tag);
+        return end ? end + strlen(end_tag) : NULL;
+    }
+    return NULL;
+}
+
 /* Return a copy of text with every <tag>...</tag> transient span removed, or
  * NULL when no span was found.  Unterminated blocks stay in place: a wrong
  * guess only produces a visible key that never matches. */
@@ -12871,20 +12927,7 @@ static char *strip_transient_blocks(const char *text) {
     while (*p) {
         const char *open = strchr(p, '<');
         if (!open) break;
-        const char *close = NULL;
-        for (size_t t = 0; t < sizeof(transient_block_tags) /
-                               sizeof(transient_block_tags[0]); t++)
-        {
-            const char *tag = transient_block_tags[t];
-            const size_t tag_len = strlen(tag);
-            if (strncmp(open + 1, tag, tag_len) || open[1 + tag_len] != '>')
-                continue;
-            char end_tag[64];
-            snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
-            const char *end = strstr(open + 1 + tag_len + 1, end_tag);
-            if (end) close = end + strlen(end_tag);
-            break;
-        }
+        const char *close = transient_block_end(open);
         if (!close) {
             buf_append(&out, p, (size_t)(open - p) + 1);
             p = open + 1;
@@ -12909,6 +12952,47 @@ static char *strip_transient_blocks(const char *text) {
     }
     buf_puts(&out, p);
     return buf_take(&out);
+}
+
+/* A visible key is measured in transient-stripped space, but the live suffix
+ * must be cut out of the raw prompt text.  Return the raw offset in `text`
+ * just past the bytes that produce its first `target` stripped bytes, or false
+ * when the stripped rendering is shorter than `target`.  Walking the same
+ * spans as strip_transient_blocks() keeps the two spaces in exact step, which
+ * is what stops a stripped key from slicing the suffix mid-block. */
+static bool stripped_prefix_raw_offset(const char *text, size_t target,
+                                       size_t *raw_off) {
+    if (raw_off) *raw_off = 0;
+    if (!text) return false;
+    size_t emitted = 0;
+    const char *p = text;
+    while (*p) {
+        const char *open = strchr(p, '<');
+        if (!open) break;
+        const char *close = transient_block_end(open);
+        if (!close) {
+            const size_t run = (size_t)(open - p) + 1;
+            if (emitted + run >= target) {
+                if (raw_off) *raw_off = (size_t)(p - text) + (target - emitted);
+                return true;
+            }
+            emitted += run;
+            p = open + 1;
+            continue;
+        }
+        size_t keep = (size_t)(open - p);
+        while (keep > 0 && isspace((unsigned char)p[keep - 1])) keep--;
+        if (emitted + keep >= target) {
+            if (raw_off) *raw_off = (size_t)(p - text) + (target - emitted);
+            return true;
+        }
+        emitted += keep;
+        p = close;
+        while (*p && isspace((unsigned char)*p)) p++;
+    }
+    if (emitted + strlen(p) < target) return false;
+    if (raw_off) *raw_off = (size_t)(p - text) + (target - emitted);
+    return true;
 }
 
 /* Clients can omit old assistant reasoning from later prompts, including Qwen
@@ -13041,18 +13125,22 @@ static bool should_remember_transient_checkpoint(const request *r,
     return true;
 }
 
-/* Remember a visible key for conversations whose user messages carry transient
- * client metadata blocks.  The key is the current transcript plus the just
- * finished assistant turn, with the transient spans stripped: exactly the
- * bytes the next request will render after the client rebuilds its history
- * without them.  When nothing was stripped, exact token-prefix matching
- * already covers the next turn and no key is kept. */
+/* Remember a visible key for the turn that just finished without tool calls.
+ * The key is the current transcript plus the assistant turn; thinking_live
+ * normalizes it to transient-stripped space, which is the space the probe
+ * compares in.
+ *
+ * The key is kept even when the prompt carries no transient block.  Exact
+ * token-prefix matching does not reliably cover the next turn: the live tokens
+ * are the model's own segmentation of the sampled text, and once the history
+ * holds a tool-call turn they stop matching the tokenization of the
+ * re-rendered prompt (measured: ``common`` frozen at the tool turn's frontier
+ * while ``live`` moves on, reason=token-mismatch). */
 static void remember_transient_checkpoint(server *s, server_slot *slot, const job *j,
                                           const char *ctx, uint64_t trace_id,
                                           const char *content, const char *reasoning,
                                           const tool_calls *calls) {
     char *visible = NULL;
-    char *stripped = NULL;
     if (j->req.prompt_text) {
         char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
         buf b = {0};
@@ -13060,21 +13148,18 @@ static void remember_transient_checkpoint(server *s, server_slot *slot, const jo
         buf_puts(&b, suffix);
         free(suffix);
         visible = buf_take(&b);
-        stripped = strip_transient_blocks(visible);
     }
-    if (!stripped) {
+    if (!visible) {
         thinking_live_clear(s, slot);
-        free(visible);
         return;
     }
-    thinking_live_remember(s, slot, stripped, &j->req);
+    const size_t keyed = thinking_live_remember(s, slot, visible, &j->req);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: transient live checkpoint remembered ctx=%s live=%d visible=%zu stripped=%zu",
-               ctx, ds4_session_pos(slot->session), strlen(visible), strlen(stripped));
+               ctx, ds4_session_pos(slot->session), strlen(visible), keyed);
     trace_event(s, trace_id,
                 "transient live checkpoint remembered: live=%d visible=%zu stripped=%zu",
-                ds4_session_pos(slot->session), strlen(visible), strlen(stripped));
-    free(stripped);
+                ds4_session_pos(slot->session), strlen(visible), keyed);
     free(visible);
 }
 
@@ -21622,6 +21707,46 @@ static void test_strip_transient_blocks(void) {
         "<environment_details_x>y</environment_details_x>") == NULL);
 }
 
+static void test_stripped_prefix_raw_offset(void) {
+    /* A visible key is measured in stripped space; the live suffix is cut from
+     * the raw text, so the mapping has to land on the raw byte just past the
+     * key for both a verbatim replay and a rebuilt one. */
+    const char *head = "abc";
+    const char *block = "<system-reminder>x</system-reminder>";
+    const char *tail = "def";
+
+    buf verbatim = {0};
+    buf_puts(&verbatim, head);
+    buf_puts(&verbatim, block);
+    buf_puts(&verbatim, tail);
+    char *stripped = strip_transient_blocks(verbatim.ptr);
+    TEST_ASSERT(stripped && !strcmp(stripped, "abcdef"));
+    free(stripped);
+
+    size_t off = 0;
+    TEST_ASSERT(stripped_prefix_raw_offset(verbatim.ptr, 3, &off));
+    TEST_ASSERT(off == 3);                          /* end of "abc" */
+    TEST_ASSERT(stripped_prefix_raw_offset(verbatim.ptr, 4, &off));
+    TEST_ASSERT(off == 3 + strlen(block) + 1);      /* just past "d" */
+    TEST_ASSERT(stripped_prefix_raw_offset(verbatim.ptr, 6, &off));
+    TEST_ASSERT(off == strlen(verbatim.ptr));
+    /* The stripped rendering is shorter than the raw one: a key longer than it
+     * must not be mapped onto a raw offset. */
+    TEST_ASSERT(!stripped_prefix_raw_offset(verbatim.ptr, 7, &off));
+
+    /* Rebuilt history: no block, so the offset is the stripped length. */
+    buf rebuilt = {0};
+    buf_puts(&rebuilt, head);
+    buf_puts(&rebuilt, tail);
+    TEST_ASSERT(strip_transient_blocks(rebuilt.ptr) == NULL);
+    TEST_ASSERT(stripped_prefix_raw_offset(rebuilt.ptr, 4, &off));
+    TEST_ASSERT(off == 4);
+    TEST_ASSERT(!stripped_prefix_raw_offset(rebuilt.ptr, 7, &off));
+
+    buf_free(&verbatim);
+    buf_free(&rebuilt);
+}
+
 static void test_transient_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -21706,6 +21831,109 @@ static void test_transient_checkpoint_visible_matches_future_prompt(void) {
     free(prompt_text);
     chat_msgs_free(&msgs);
     chat_msgs_free(&history);
+}
+
+static void test_thinking_visible_binds_verbatim_transient_replay(void) {
+    /* Live-server regression: after a turn that ended without tool calls, the
+     * visible key was stored transient-stripped while the probe compared
+     * against the raw rendering.  A client that replays the <system-reminder>
+     * spans verbatim therefore never matched, and the next request paid a full
+     * re-prefill even though the live checkpoint was intact.  Both sides are
+     * normalized now, and the key length is mapped back onto the raw text so
+     * the suffix is cut at the right byte. */
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    int toks[12];
+    for (int i = 0; i < 12; i++) toks[i] = i + 1;
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(toks, 12);
+
+    const char *head = "system prompt\n";
+    const char *user = "first question";
+    const char *block = "<system-reminder>workspace state</system-reminder>";
+    const char *asst = "the answer";
+    const size_t raw_asst_end = strlen(head) + strlen(user) + strlen(block) +
+                                strlen(asst);
+    const size_t stripped_asst_end = strlen(head) + strlen(user) + strlen(asst);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    buf frontier = {0};
+    buf_puts(&frontier, head);
+    buf_puts(&frontier, user);
+    buf_puts(&frontier, block);
+    buf_puts(&frontier, asst);
+
+    const size_t keyed = thinking_live_remember(&s, &slot, frontier.ptr, &r);
+    TEST_ASSERT(keyed == stripped_asst_end);
+    TEST_ASSERT(slot.thinking_live.valid);
+    TEST_ASSERT(slot.thinking_live.live_tokens == 12);
+    TEST_ASSERT(slot.thinking_live.visible_text != NULL);
+    TEST_ASSERT(strstr(slot.thinking_live.visible_text,
+                       "<system-reminder>") == NULL);
+
+    /* 1. Verbatim replay: the block stays in the client's history. */
+    {
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        buf next = {0};
+        buf_puts(&next, head);
+        buf_puts(&next, user);
+        buf_puts(&next, block);
+        buf_puts(&next, asst);
+        buf_puts(&next, "second question");
+        j.req.prompt_text = buf_take(&next);
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_THINKING_VISIBLE);
+        TEST_ASSERT(pr.reuse_tokens == 12);
+        TEST_ASSERT(pr.suffix_off == raw_asst_end);
+        TEST_ASSERT(!strcmp(j.req.prompt_text + pr.suffix_off, "second question"));
+        request_free(&j.req);
+    }
+
+    /* 2. Rebuilt history: the client drops the block from the replay. */
+    {
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        buf next = {0};
+        buf_puts(&next, head);
+        buf_puts(&next, user);
+        buf_puts(&next, asst);
+        buf_puts(&next, "second question");
+        j.req.prompt_text = buf_take(&next);
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_THINKING_VISIBLE);
+        TEST_ASSERT(pr.suffix_off == stripped_asst_end);
+        TEST_ASSERT(!strcmp(j.req.prompt_text + pr.suffix_off, "second question"));
+        request_free(&j.req);
+    }
+
+    /* 3. A prompt that diverges inside the assistant turn must not bind. */
+    {
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        buf next = {0};
+        buf_puts(&next, head);
+        buf_puts(&next, user);
+        buf_puts(&next, block);
+        buf_puts(&next, "a different answer");
+        j.req.prompt_text = buf_take(&next);
+        ds4_tokens_push(&j.req.prompt, 999);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        request_free(&j.req);
+    }
+
+    visible_live_free(&slot.thinking_live);
+    ds4_session_free_test_checkpoint(slot.session);
+    request_free(&r);
+    buf_free(&frontier);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_tool_marker_state_ignores_orphan_end(void) {
@@ -23328,8 +23556,10 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_strip_transient_blocks();
+    test_stripped_prefix_raw_offset();
     test_transient_checkpoint_remember_gate();
     test_transient_checkpoint_visible_matches_future_prompt();
+    test_thinking_visible_binds_verbatim_transient_replay();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
