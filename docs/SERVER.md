@@ -152,6 +152,36 @@ Quantization variants may share compatible prefixes. Add
 Cache files contain prompt text and model state: treat the directory as
 private. It is disposable; stop the server before clearing it.
 
+## Live KV rewind
+
+A client that rewrites its own history (summarizing older turns, pruning tool
+results) sends a prompt that shares a long token prefix with the live session
+and then diverges. The server rewinds the live KV to a position at or below the
+shared prefix and re-reads only the tail, instead of rebuilding the whole
+prompt.
+
+GLM-5.3 carries a recurrent linear-attention state that cannot be truncated to
+roll back, so it rewinds to the newest snapshot taken during prefill. Two
+variables size that snapshot ring, per session:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DS4_GLM_REWIND_SLOTS` | 8 | Snapshots kept; `0` turns the ring off |
+| `DS4_GLM_REWIND_STRIDE` | 8192 | Tokens between two snapshots |
+
+A slot costs about 145 MiB at the GLM-5.3 shape, so the defaults make the last
+~65k positions rewritable for ~1.1 GiB and a divergence re-reads at most one
+stride plus the new tail instead of the whole context. A history edit older than
+that window finds no snapshot and prefills from scratch. Buying the depth with
+`DS4_GLM_REWIND_STRIDE` is usually the wrong trade: over 126 requests of a
+recorded agent session, `8 x 16384` (same memory) removed that one rebuild but
+re-read up to a stride on every other rewind, costing 17% more wall clock and
+15% more re-prefilled tokens. Prefer more `DS4_GLM_REWIND_SLOTS`, which extends
+the window without taxing ordinary rewinds. An edit that drops most of the
+context is expensive under any setting: there is no long prefix left to reuse.
+Snapshots are taken while reading prompts, not while generating; a session whose
+checkpoint holds images is never rewound.
+
 ## Tool history and debugging
 
 For DeepSeek, the server preserves sampled DSML tool blocks and assigns
