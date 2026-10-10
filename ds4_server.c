@@ -17399,6 +17399,7 @@ static bool parse_chunk_extensions(const char *s, size_t len, size_t *pos) {
         while (*pos < len && http_is_token_char((unsigned char)s[*pos])) (*pos)++;
         if (*pos == name_start) return false;
 
+        size_t name_end = *pos;
         skip_http_bws(s, len, pos);
         if (*pos < len && s[*pos] == '=') {
             (*pos)++;
@@ -17410,6 +17411,9 @@ static bool parse_chunk_extensions(const char *s, size_t len, size_t *pos) {
                 while (*pos < len && http_is_token_char((unsigned char)s[*pos])) (*pos)++;
                 if (*pos == value_start) return false;
             }
+        } else {
+            /* BWS belongs to '=' or the next ';', not the line end. */
+            *pos = name_end;
         }
     }
     return true;
@@ -28819,6 +28823,61 @@ static void test_http_transfer_encoding_accepts_only_supported_single_chunked(vo
     }
 }
 
+static void test_http_chunk_extension_whitespace_requires_a_separator(void) {
+    const char *valid[] = {
+        ";flag",
+        " \t; \tflag",
+        ";flag \t= \tyes",
+        ";flag \t; next",
+        ";note=yes \t; flag",
+        ";note=\"a;\\\"b\" \t; flag",
+        ";flag \t= \t\"yes\" \t; next \t= \tok",
+    };
+    const char *invalid[] = {
+        ";flag ", ";flag\t",
+        ";note=yes ", ";note=yes\t",
+        ";note=\"yes\" ", ";note=\"yes\"\t",
+        ";note=yes ;flag ", ";note=yes\t;flag\t",
+        ";note=\"yes\" ;flag ", ";note=\"yes\"\t;flag\t",
+        ";note=\"yes\"next", ";note=yes \"next\"",
+        ";note=\"yes\"=next", ";note=yes\t=next",
+    };
+    /* Exercise both data and last chunks, including the complete client
+     * refusal path: HTTP 400, connection close, and client-count discharge. */
+    for (int last = 0; last < 2; last++) {
+        for (int accepted = 0; accepted < 2; accepted++) {
+            const char **cases = accepted ? valid : invalid;
+            size_t count = accepted ? sizeof(valid) / sizeof(valid[0]) :
+                                      sizeof(invalid) / sizeof(invalid[0]);
+            for (size_t i = 0; i < count; i++) {
+                buf raw = {0};
+                buf_puts(&raw, "GET /not-found HTTP/1.1\r\n"
+                               "Transfer-Encoding: chunked\r\n\r\n");
+                buf_puts(&raw, last ? "0" : "1");
+                buf_puts(&raw, cases[i]);
+                buf_puts(&raw, last ? "\r\n\r\n" : "\r\nA\r\n0\r\n\r\n");
+                http_request req = {0};
+                bool parsed = parse_http_test_request(raw.ptr, &req);
+                TEST_ASSERT(parsed == (accepted != 0));
+                if (parsed && accepted) {
+                    TEST_ASSERT(req.body_len == (last ? 0u : 1u));
+                    if (!last) TEST_ASSERT(req.body[0] == 'A');
+                }
+                http_request_free(&req);
+                if (accepted) {
+                    memset(&req, 0, sizeof(req));
+                    TEST_ASSERT(parse_http_test_request_one_byte_chunks(raw.ptr, &req));
+                    TEST_ASSERT(req.body_len == (last ? 0u : 1u));
+                    http_request_free(&req);
+                } else {
+                    TEST_ASSERT(http_test_client_rejects_and_closes(raw.ptr));
+                }
+                buf_free(&raw);
+            }
+        }
+    }
+}
+
 static void test_anthropic_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -29468,6 +29527,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_http_transfer_encoding_accepts_only_supported_single_chunked();
+    test_http_chunk_extension_whitespace_requires_a_separator();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
     test_openai_inline_webp_image_content();
