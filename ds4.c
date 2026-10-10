@@ -39418,6 +39418,68 @@ static uint64_t glm53_graph_fixed_state_bytes(uint32_t layer_start,
     return persistent + scratch;
 }
 
+/* DS4_GLM_REWIND_SLOTS=<n> sizes the live-rewind snapshot ring (0 disables
+ * it); DS4_GLM_REWIND_STRIDE=<tokens> is the distance between two snapshots.
+ * A GLM-5.3 session cannot be rolled back by truncating position-indexed
+ * rows: the KDA conv/recurrent state is a recurrence and a pooled indexer
+ * group that straddles the resume point reads its tail buffer, so both have
+ * to be snapshotted.  Eight 8192-token snapshots cover the last 65k
+ * positions for ~1.16 GiB at the GLM-5.3 shape. */
+#define DS4_GLM_REWIND_DEFAULT_SLOTS  8u
+#define DS4_GLM_REWIND_DEFAULT_STRIDE 8192u
+#define DS4_GLM_REWIND_MAX_SLOTS      64u
+#define DS4_GLM_REWIND_MAX_STRIDE     (1u << 22)
+
+static uint32_t glm53_rewind_slots(void) {
+    const char *env = getenv("DS4_GLM_REWIND_SLOTS");
+    long slots = env && env[0] ? strtol(env, NULL, 10) :
+                                 (long)DS4_GLM_REWIND_DEFAULT_SLOTS;
+    if (slots < 0) slots = 0;
+    if ((unsigned long)slots > DS4_GLM_REWIND_MAX_SLOTS) {
+        slots = (long)DS4_GLM_REWIND_MAX_SLOTS;
+    }
+    return (uint32_t)slots;
+}
+
+static uint32_t glm53_rewind_stride(void) {
+    const char *env = getenv("DS4_GLM_REWIND_STRIDE");
+    long stride = env && env[0] ? strtol(env, NULL, 10) :
+                                  (long)DS4_GLM_REWIND_DEFAULT_STRIDE;
+    if (stride < 1) stride = (long)DS4_GLM_REWIND_DEFAULT_STRIDE;
+    if ((unsigned long)stride > DS4_GLM_REWIND_MAX_STRIDE) {
+        stride = (long)DS4_GLM_REWIND_MAX_STRIDE;
+    }
+    return (uint32_t)stride;
+}
+
+/* The tensors glm53_graph_spec_state_tensors() enumerates, sized from the
+ * shape alone so the memory guard can reserve the ring before the graph
+ * exists.  Non-KDA layers are charged their indexer tail even when the layer
+ * has no full indexer; the over-estimate is a few tens of KiB. */
+static uint64_t glm53_graph_spec_state_estimate_bytes(uint32_t layer_start,
+                                                      uint32_t layer_end) {
+    if (!ds4_model_is_glm53()) return 0;
+    const uint64_t projection =
+        (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t kda_state =
+        (3u * (DS4_N_KDA_CONV - 1u) * projection +
+         projection * DS4_N_KDA_HEAD_DIM) * sizeof(float);
+    const uint64_t indexer_tail =
+        2u * DS4_GLM53_INDEX_POOL_SIZE * DS4_N_INDEXER_HEAD_DIM *
+        sizeof(float);
+    uint64_t total = 0;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        total += ds4_glm53_layer_is_kda(il) ? kda_state : indexer_tail;
+    }
+    return total;
+}
+
+static uint64_t glm53_graph_rewind_ring_bytes(uint32_t layer_start,
+                                              uint32_t layer_end) {
+    return (uint64_t)glm53_rewind_slots() *
+           glm53_graph_spec_state_estimate_bytes(layer_start, layer_end);
+}
+
 static uint64_t glm_graph_full_kv_cache_elem_bytes(void) {
     return sizeof(uint16_t);
 }
@@ -39896,7 +39958,8 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap_slic
         glm_graph_workspace_bytes_for_cap(work_ctx,
                                           compact_cap,
                                           ssd_streaming) +
-        glm53_graph_fixed_state_bytes(layer_start, layer_end);
+        glm53_graph_fixed_state_bytes(layer_start, layer_end) +
+        glm53_graph_rewind_ring_bytes(layer_start, layer_end);
     if (compact_cap != 0) {
         m.comp_cap = compact_cap;
         m.compressed_bytes =
@@ -45519,6 +45582,22 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_state_backup;
     float          *mtp_logits_host;
     int             mtp_ready;
+    /* Live-rewind snapshots (GLM-5.3).  The KDA conv/recurrent state is a
+     * recurrence and a straddling pooled indexer group reads its tail buffer,
+     * so a session below the live frontier cannot be rebuilt by truncating
+     * position-indexed rows.  `rewind_slots` full spec-state copies are taken
+     * one every `rewind_stride` prefill tokens; ds4_session_rewind_snapshot()
+     * restores the newest one at or below the target and lets the next sync
+     * replay the tail through the normal prefill path.  Allocated lazily on
+     * the first snapshot; DS4_GLM_REWIND_SLOTS=0 leaves it NULL. */
+    ds4_gpu_tensor *rewind_state_ring;
+    uint32_t        rewind_slots;
+    uint32_t        rewind_stride;
+    int             rewind_head;                 /* last written slot, -1 empty */
+    /* Set once the ring is switched off or its allocation/copy failed, so the
+     * prefill loop does not retry a losing allocation on every chunk. */
+    bool            rewind_off;
+    uint32_t        rewind_pos[DS4_GLM_REWIND_MAX_SLOTS];
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -47301,12 +47380,17 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_concat);
     ds4_gpu_tensor_free(g->mtp_selected);
     ds4_gpu_tensor_free(g->mtp_state_backup);
+    ds4_gpu_tensor_free(g->rewind_state_ring);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
     g->mtp_concat = NULL;
     g->mtp_selected = NULL;
     g->mtp_state_backup = NULL;
+    g->rewind_state_ring = NULL;
+    g->rewind_slots = 0;
+    g->rewind_head = -1;
+    g->rewind_off = false;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -51569,16 +51653,20 @@ static uint64_t glm53_graph_spec_state_bytes(const ds4_glm_gpu_graph *g) {
     return total;
 }
 
-static bool glm53_graph_copy_spec_state(
+static bool glm53_graph_copy_spec_state_into(
         ds4_glm_gpu_graph *g,
-        bool save) {
-    if (!g || !g->glm53 || !g->mtp_state_backup) return false;
+        ds4_gpu_tensor   *dst,
+        uint64_t          dst_offset,
+        bool              save) {
+    if (!g || !g->glm53 || !dst) return false;
     const uint64_t expected = glm53_graph_spec_state_bytes(g);
-    if (expected == 0 || ds4_gpu_tensor_bytes(g->mtp_state_backup) < expected) {
+    if (expected == 0 ||
+        ds4_gpu_tensor_bytes(dst) < dst_offset ||
+        ds4_gpu_tensor_bytes(dst) - dst_offset < expected) {
         return false;
     }
     bool ok = glm_graph_begin_commands_if_needed();
-    uint64_t offset = 0;
+    uint64_t offset = dst_offset;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         ds4_gpu_tensor *state[2];
         glm53_graph_spec_state_tensors(g, il, state);
@@ -51586,7 +51674,7 @@ static bool glm53_graph_copy_spec_state(
             if (!state[i]) continue;
             const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
             if (save) {
-                ok = ds4_gpu_tensor_copy(g->mtp_state_backup,
+                ok = ds4_gpu_tensor_copy(dst,
                                          offset,
                                          state[i],
                                          0,
@@ -51594,7 +51682,7 @@ static bool glm53_graph_copy_spec_state(
             } else {
                 ok = ds4_gpu_tensor_copy(state[i],
                                          0,
-                                         g->mtp_state_backup,
+                                         dst,
                                          offset,
                                          bytes) != 0;
             }
@@ -51603,7 +51691,50 @@ static bool glm53_graph_copy_spec_state(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    return ok && offset == expected;
+    return ok && offset == dst_offset + expected;
+}
+
+static bool glm53_graph_copy_spec_state(
+        ds4_glm_gpu_graph *g,
+        bool save) {
+    if (!g || !g->mtp_state_backup) return false;
+    return glm53_graph_copy_spec_state_into(g, g->mtp_state_backup, 0, save);
+}
+
+/* Lazily allocate the live-rewind ring.  Returns false (and leaves the ring
+ * switched off) when the model has no rewritable recurrence, the ring is
+ * disabled, or the allocation fails: a missing ring only costs a cold
+ * prefill, so a failure is never retried. */
+static bool glm53_graph_rewind_ring_init(ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53 || g->rewind_off) return false;
+    if (g->rewind_state_ring) return true;
+    const uint32_t slots = glm53_rewind_slots();
+    if (slots == 0) {
+        g->rewind_off = true;
+        return false;
+    }
+    const uint64_t per_slot = glm53_graph_spec_state_bytes(g);
+    if (per_slot == 0) {
+        g->rewind_off = true;
+        return false;
+    }
+    ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc((uint64_t)slots * per_slot);
+    if (!ring) {
+        fprintf(stderr,
+                "ds4: GLM live rewind disabled: %.2f GiB snapshot ring "
+                "allocation failed\n",
+                (double)((uint64_t)slots * per_slot) / (1024.0 * 1024.0 * 1024.0));
+        g->rewind_off = true;
+        return false;
+    }
+    g->rewind_state_ring = ring;
+    g->rewind_slots = slots;
+    g->rewind_stride = glm53_rewind_stride();
+    g->rewind_head = -1;
+    for (uint32_t i = 0; i < DS4_GLM_REWIND_MAX_SLOTS; i++) {
+        g->rewind_pos[i] = UINT32_MAX;
+    }
+    return true;
 }
 
 static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
@@ -60775,6 +60906,10 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    /* Unit-test hook for ds4_session_rewind_floor(): graph-less test
+     * checkpoints have no snapshot ring, so the probe's GLM rewind tier would
+     * be unreachable without it.  Zero (calloc default) means unset. */
+    int test_rewind_floor;
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
@@ -74510,6 +74645,120 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     return ok;
 }
 
+/* ---- GLM-5.3 live-rewind snapshots -------------------------------------
+ *
+ * The KDA conv/recurrent state is a recurrence, and a pooled indexer group
+ * that straddles the resume point reads its tail buffer, so neither can be
+ * recovered by truncating position-indexed rows.  Snapshots of exactly those
+ * tensors are taken at prefill chunk ends every DS4_GLM_REWIND_STRIDE tokens;
+ * a rewind restores the newest one at or below the target and leaves the
+ * session valid there.  The caller then continues from that position through
+ * the ordinary prefill path, which rebuilds everything between the snapshot
+ * and the target exactly as a normal continuation would.
+ * ---------------------------------------------------------------------- */
+
+/* Take a snapshot when the chunk that just ended crossed a stride boundary. */
+static void ds4_session_glm_rewind_note(ds4_session *s, uint32_t pos) {
+    if (!s || !s->glm_graph.glm53 || !s->glm_graph_ready) return;
+    /* Tensor-parallel ranks are kept in step by ds4_tp_send_rewind(), which has
+     * no snapshot counterpart: a leader restoring a ring slot on its own would
+     * leave the workers holding the positions above it.  Take no snapshots for a
+     * TP session, which leaves ds4_session_rewind_floor() answering "nothing
+     * reachable" and the server probe on the path it already uses. */
+    if (s->engine && s->engine->tp.active) return;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!glm53_graph_rewind_ring_init(g)) return;
+    if (g->rewind_head >= 0) {
+        const uint32_t last = g->rewind_pos[g->rewind_head];
+        if (last != UINT32_MAX &&
+            (uint64_t)pos < (uint64_t)last + g->rewind_stride) {
+            return;
+        }
+    }
+    const uint32_t slot =
+        g->rewind_head < 0 ? 0u :
+        (uint32_t)((g->rewind_head + 1) % (int)g->rewind_slots);
+    const uint64_t per_slot = glm53_graph_spec_state_bytes(g);
+    if (per_slot == 0) return;
+    if (!glm53_graph_copy_spec_state_into(g, g->rewind_state_ring,
+                                          (uint64_t)slot * per_slot, true)) {
+        /* A failed copy must not leave a slot claiming a position it does
+         * not hold; drop the whole ring and fall back to cold prefills. */
+        fprintf(stderr,
+                "ds4: GLM live rewind disabled: snapshot copy failed at "
+                "pos=%u\n", pos);
+        ds4_gpu_tensor_free(g->rewind_state_ring);
+        g->rewind_state_ring = NULL;
+        g->rewind_slots = 0;
+        g->rewind_head = -1;
+        g->rewind_off = true;
+        return;
+    }
+    g->rewind_pos[slot] = pos;
+    g->rewind_head = (int)slot;
+}
+
+/* The largest position at or below `pos` this session can actually be rewound
+ * to, or -1 when no snapshot is reachable.  Read-only: the reuse probe calls
+ * it (from the dispatcher, without the inference lock, like the rest of the
+ * probe) to name a target the rewind will honour instead of one it will
+ * refuse.  A racing snapshot write can at worst name a slot the restore then
+ * re-checks and refuses, which only costs a cold prefill. */
+int ds4_session_rewind_floor(ds4_session *s, int pos) {
+    if (!s || pos <= 0) return -1;
+    if (!s->glm_graph_ready) {
+        return s->test_rewind_floor > 0 && s->test_rewind_floor <= pos ?
+               s->test_rewind_floor : -1;
+    }
+    const ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!g->glm53 || !g->rewind_state_ring || g->rewind_head < 0) return -1;
+    int best = -1;
+    for (uint32_t i = 0; i < g->rewind_slots && i < DS4_GLM_REWIND_MAX_SLOTS; i++) {
+        const uint32_t p = g->rewind_pos[i];
+        if (p == UINT32_MAX || p > (uint32_t)pos) continue;
+        if (best < 0 || p > (uint32_t)best) best = (int)p;
+    }
+    return best;
+}
+
+/* Restore the live-rewind snapshot exactly at `pos`, leaving the session
+ * valid there.  Returns false without touching the session when no snapshot
+ * sits there, so the caller keeps its ordinary rewind/rebuild path.
+ *
+ * Deliberately separate from ds4_session_rewind(): that one is also the
+ * speculative stop-boundary rewind, whose caller may sample again straight
+ * away and therefore needs fresh logits.  This entry point is for the reuse
+ * probe's continuation path, which always re-reads at least the final prompt
+ * token and so rebuilds them. */
+bool ds4_session_rewind_snapshot(ds4_session *s, int pos) {
+    if (!s || !s->glm_graph_ready) return false;
+    if (s->engine && s->engine->tp.active) return false;  /* see rewind_note */
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!g->glm53 || !g->rewind_state_ring || pos <= 0) return false;
+    if (ds4_session_rewind_floor(s, pos) != pos) return false;
+    if (s->checkpoint_image_count != 0) return false;
+    const uint64_t per_slot = glm53_graph_spec_state_bytes(g);
+    if (per_slot == 0) return false;
+    int slot = -1;
+    for (uint32_t i = 0; i < g->rewind_slots && i < DS4_GLM_REWIND_MAX_SLOTS; i++) {
+        if (g->rewind_pos[i] == (uint32_t)pos) { slot = (int)i; break; }
+    }
+    if (slot < 0) return false;
+    if (!glm53_graph_copy_spec_state_into(g, g->rewind_state_ring,
+                                          (uint64_t)slot * per_slot, false)) {
+        return false;
+    }
+    /* The dense/DSA rows below the target are still valid: they are addressed
+     * by absolute position and the continuation rewrites every row above it. */
+    s->glm_dense_cache_len = (uint32_t)pos;
+    s->checkpoint.len = pos;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_rollback_valid = false;
+    return true;
+}
+
 static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
                                       int *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
@@ -74864,6 +75113,24 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     return 1;
 }
 #endif
+#endif
+
+#ifdef DS4_NO_GPU
+/* The live-rewind ring snapshots GPU graph state, so the CPU reference build
+ * has nothing to rewind.  The server's reuse probe is compiled for every
+ * backend and asks these two, so they answer "nothing reachable" here and the
+ * caller keeps its ordinary rebuild path. */
+int ds4_session_rewind_floor(ds4_session *s, int pos) {
+    (void)s;
+    (void)pos;
+    return -1;
+}
+
+bool ds4_session_rewind_snapshot(ds4_session *s, int pos) {
+    (void)s;
+    (void)pos;
+    return false;
+}
 #endif
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
@@ -76233,6 +76500,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 if (pos < s->glm_graph.ctx_cap) {
                     ds4_session_glm_note_dense_cache(s, pos, chunk);
                 }
+                ds4_session_glm_rewind_note(s, pos + chunk);
                 i += (int)chunk;
                 if (s->progress) {
                     s->progress(s->progress_ud, "prefill_chunk", i,
@@ -85928,6 +86196,19 @@ void ds4_test_use_deepseek41_shape(int on) {
     }
 }
 
+void ds4_test_use_glm53_shape(int on) {
+    static ds4_shape saved;
+    static bool active;
+    if (on && !active) {
+        saved = g_ds4_shape;
+        g_ds4_shape = DS4_SHAPE_GLM53;
+        active = true;
+    } else if (!on && active) {
+        g_ds4_shape = saved;
+        active = false;
+    }
+}
+
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
@@ -85940,6 +86221,13 @@ void ds4_session_free_test_checkpoint(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     free(s->checkpoint_images);
     free(s);
+}
+
+/* Unit-test hook: a graph-less test checkpoint has no snapshot ring, so this
+ * stands in for the reachable rewind target the probe would otherwise ask the
+ * GLM-5.3 graph for. */
+void ds4_session_set_test_rewind_floor(ds4_session *s, int pos) {
+    if (s) s->test_rewind_floor = pos > 0 ? pos : 0;
 }
 
 void ds4_session_set_test_images(ds4_session *s,

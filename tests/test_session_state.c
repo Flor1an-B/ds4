@@ -160,6 +160,45 @@ static void test_rewind(void) {
     ds4_session_free(s);
 }
 
+#ifndef DS4_NO_GPU
+/* The reuse probe names a rewind target from this floor, so its bookkeeping
+ * has to hold with no GPU work and no model: the newest snapshot at or below
+ * the target, nothing when the ring is off or still empty, and a refusal --
+ * not a partial restore -- for a position the ring does not hold. */
+static void test_glm_rewind_floor(void) {
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    assert(ds4_session_rewind_floor(s, 100) == -1);   /* no graph yet */
+    s->glm_graph_ready = true;
+    s->glm_graph.glm53 = true;
+    /* Allocated nothing: DS4_GLM_REWIND_SLOTS=0, or the allocation failed. */
+    assert(ds4_session_rewind_floor(s, 100) == -1);
+    /* Only the ring pointer is read here, never the tensor. */
+    s->glm_graph.rewind_state_ring = (ds4_gpu_tensor *)s;
+    s->glm_graph.rewind_slots = 3;
+    s->glm_graph.rewind_head = -1;
+    for (uint32_t i = 0; i < DS4_GLM_REWIND_MAX_SLOTS; i++)
+        s->glm_graph.rewind_pos[i] = UINT32_MAX;
+    assert(ds4_session_rewind_floor(s, 100) == -1);   /* allocated, empty */
+    s->glm_graph.rewind_pos[0] = 64;
+    s->glm_graph.rewind_pos[1] = 8192;
+    s->glm_graph.rewind_pos[2] = 16384;
+    s->glm_graph.rewind_head = 2;
+    assert(ds4_session_rewind_floor(s, 10) == -1);     /* below every slot */
+    assert(ds4_session_rewind_floor(s, 64) == 64);     /* exact hit */
+    assert(ds4_session_rewind_floor(s, 9000) == 8192); /* newest below */
+    assert(ds4_session_rewind_floor(s, 1 << 20) == 16384);
+    /* A slot the ring no longer holds must not be offered. */
+    s->glm_graph.rewind_pos[1] = UINT32_MAX;
+    assert(ds4_session_rewind_floor(s, 9000) == 64);
+    /* No ring: the restore reports "not mine" without touching the session. */
+    s->glm_graph.rewind_state_ring = NULL;
+    assert(!ds4_session_rewind_snapshot(s, 64));
+    assert(s->checkpoint.len == 0 && !s->checkpoint_valid);
+    ds4_session_free(s);
+}
+#endif
+
 static void test_session_memory(void) {
     const uint64_t gib = UINT64_C(1) << 30;
     ds4_engine e = { .backend = DS4_BACKEND_METAL,
@@ -519,6 +558,44 @@ static void test_glm_spec_rollback(void) {
             for (int j = 0; j < 128; j++) assert(state[j] == 11);
         }
     }
+    /* The live-rewind ring stores the same tensors at per-slot offsets, so a
+     * restore from a non-zero slot must reproduce the saved state exactly and
+     * an offset past the ring must be refused rather than clamped. */
+    {
+        const uint64_t slots = 2;
+        ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc(slots * bytes);
+        assert(ring);
+        for (int il = 0; il < 3; il++) {
+            assert(ds4_gpu_tensor_fill_f32(
+                g->layer_kda_conv_state[il], 3, 64));
+            assert(ds4_gpu_tensor_fill_f32(
+                g->layer_kda_recurrent_state[il], 5, 128));
+        }
+        assert(glm53_graph_copy_spec_state_into(g, ring, bytes, true));
+        for (int il = 0; il < 3; il++) {
+            assert(ds4_gpu_tensor_fill_f32(
+                g->layer_kda_conv_state[il], -9, 64));
+            assert(ds4_gpu_tensor_fill_f32(
+                g->layer_kda_recurrent_state[il], -9, 128));
+        }
+        assert(glm53_graph_copy_spec_state_into(g, ring, bytes, false));
+        for (int il = 0; il < 3; il++) {
+            float state[128];
+            assert(ds4_gpu_tensor_read(g->layer_kda_conv_state[il], 0,
+                                       state, 64 * sizeof(float)));
+            for (int j = 0; j < 64; j++) assert(state[j] == 3);
+            assert(ds4_gpu_tensor_read(g->layer_kda_recurrent_state[il], 0,
+                                       state, sizeof(state)));
+            for (int j = 0; j < 128; j++) assert(state[j] == 5);
+        }
+        assert(!glm53_graph_copy_spec_state_into(
+            g, ring, slots * bytes, true));
+        assert(!glm53_graph_copy_spec_state_into(
+            g, ring, slots * bytes, false));
+        ds4_gpu_tensor_free(ring);
+        puts("GLM live rewind: snapshot ring restores from a slot offset, "
+             "out-of-range offsets refused: PASS");
+    }
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(gate);
     glm_graph_free(g);
@@ -539,6 +616,7 @@ int main(void) {
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
+    test_glm_rewind_floor();
     test_glm_spec_rollback();
 #endif
     puts("session state tests: ok");

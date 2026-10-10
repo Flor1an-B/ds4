@@ -483,6 +483,12 @@ ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
 /* Test hook: server logic runs as if a V4.1 model were loaded (on=1) until
  * restored (on=0). */
 void ds4_test_use_deepseek41_shape(int on);
+/* Test hook: server logic runs as if a GLM-5.3 model were loaded (on=1) until
+ * restored (on=0), so the GLM rewind tiers are probeable without one. */
+void ds4_test_use_glm53_shape(int on);
+/* Test hook: stand in for the snapshot floor a graph-less checkpoint has no
+ * ring to report.  pos <= 0 clears it. */
+void ds4_session_set_test_rewind_floor(ds4_session *s, int pos);
 void ds4_session_free_test_checkpoint(ds4_session *s);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
@@ -593,6 +599,18 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* The largest position at or below `pos` this session can actually be rewound
+ * to without rebuilding, or -1 when nothing is reachable.  Read-only; the
+ * server's reuse probe uses it to name a target ds4_session_rewind() honours.
+ * GLM-5.3 answers from its live-rewind snapshot ring. */
+int ds4_session_rewind_floor(ds4_session *s, int pos);
+/* Restore the live-rewind snapshot exactly at `pos` (a position
+ * ds4_session_rewind_floor() reported), leaving the checkpoint valid there.
+ * False means nothing was changed and the caller must use ds4_session_rewind()
+ * or rebuild.  For continuation callers only: unlike ds4_session_rewind() it
+ * does not refresh logits, so a caller that samples immediately must not use
+ * it. */
+bool ds4_session_rewind_snapshot(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
