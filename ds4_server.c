@@ -4284,9 +4284,9 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
  *
  * Two keys carry that proof.  The full-input key renders the request's whole
  * message list; it is published with the frontier.  The parent key renders the
- * same list without the pending assistant turn and its trailing tool results,
- * so a replay continuation reproduces the full-input key of the request that
- * generated that turn.  Both keys end in the renderer's assistant generation
+ * same list without the pending assistant turn and its trailing tool results
+ * and user messages. A replay continuation reproduces the full-input key
+ * which generated that turn. Both keys end in the assistant generation
  * prefix; the newest assistant's reasoning and sampled tool-call bytes are
  * deliberately outside the comparison.
  *
@@ -4327,7 +4327,7 @@ static char *render_tool_flow_key(server_model_syntax syntax,
 }
 
 /* Parent view: every message except the pending assistant turn at `anchor` and
- * its tool results in [tail_start, tail_end).  Shallow: the entries stay owned
+ * its new suffix in [tail_start, tail_end).  Shallow: the entries stay owned
  * by `msgs`.  Keeping the whole view is what makes a compacted or edited
  * middle history a mismatch instead of an accidental prefix hit. */
 static char *render_tool_parent_key(server_model_syntax syntax,
@@ -4363,13 +4363,18 @@ static void responses_prepare_live_continuation(server *s, request *r,
                                                 const char *tool_schemas) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
-    int tail_start = msgs->len;
+    /* User messages queued after tool results are part of the new suffix.
+     * Keep them in the renderer, outside the remembered parent comparison. */
+    int tool_end = msgs->len;
+    while (tool_end > 0 && !strcmp(msgs->v[tool_end - 1].role, "user"))
+        tool_end--;
+    int tail_start = tool_end;
     while (tail_start > 0) {
         const chat_msg *m = &msgs->v[tail_start - 1];
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) break;
         tail_start--;
     }
-    if (tail_start == msgs->len) {
+    if (tail_start == tool_end) {
         /* No tool-output tail: not a continuation, but this request may still
          * generate the next frontier, so remember its canonical full input. */
         r->full_input_key = render_tool_flow_key(r->model_syntax, msgs,
@@ -17998,6 +18003,8 @@ static void test_slot_probe_tool_parent_guard(void) {
     static const char result[] =
         "{\"type\":\"function_call_output\",\"call_id\":\"call_live\","
         "\"output\":\"a.c b.c\"}";
+    static const char notification[] =
+        "{\"role\":\"user\",\"content\":\"Background check finished.\"}";
 
     /* --- Responses: same input, rewritten input, results-only. --- */
     {
@@ -18027,16 +18034,101 @@ static void test_slot_probe_tool_parent_guard(void) {
                     REUSE_RESPONSES_TOOL_OUTPUT);
         request_free(&replay);
 
+        /* A notification after the result is new suffix content, not part
+         * of the parent which generated the pending assistant call. */
+        const int notification_counts[] = {1, 9};
+        for (size_t n = 0; n < sizeof(notification_counts) / sizeof(notification_counts[0]); n++) {
+            buf_printf(&in, "[%s,%s,%s,%s", sys_pi, user_list,
+                       pending_reformatted, result);
+            for (int i = 0; i < notification_counts[n]; i++) {
+                buf_printf(&in, ",{\"role\":\"user\",\"content\":\"Notification %d.\"}", i);
+            }
+            buf_puts(&in, "]");
+            prepare_qwen_responses_turn(&replay, in.ptr, tools_a);
+            buf_free(&in);
+            TEST_ASSERT(!replay.tool_delta_only);
+            TEST_ASSERT(qwen_tool_ids_match(&slot, &replay, false));
+            TEST_ASSERT(replay.tool_parent_key != NULL);
+            if (replay.tool_parent_key)
+                TEST_ASSERT(!strcmp(replay.tool_parent_key, frontier.full_input_key));
+            slot_reuse pr = probe_qwen_tool_replay(&s, &slot, &replay);
+            TEST_ASSERT(pr.kind == REUSE_RESPONSES_TOOL_OUTPUT && pr.reuse_tokens == 10);
+            TEST_ASSERT(replay.responses_live_suffix_text != NULL);
+            if (replay.responses_live_suffix_text) {
+                const char *tail = replay.responses_live_suffix_text;
+                const char *start = "<|im_start|>user\n<tool_response>\na.c b.c\n</tool_response>";
+                const char *result = strstr(tail, start);
+                TEST_ASSERT(result != NULL);
+                TEST_ASSERT(strstr(tail, "<tool_call>") == NULL);
+                if (result) tail = result + strlen(start);
+                TEST_ASSERT(strstr(tail, "<tool_response>") == NULL);
+                for (int i = 0; i < notification_counts[n]; i++) {
+                    char text[48];
+                    snprintf(text, sizeof(text), "Notification %d.", i);
+                    const char *found = strstr(tail, text);
+                    TEST_ASSERT(found != NULL);
+                    if (found) {
+                        tail = found + strlen(text);
+                        TEST_ASSERT(strstr(tail, text) == NULL);
+                    }
+                }
+                TEST_ASSERT(strstr(tail, "<|im_start|>assistant\n<think>\n") != NULL);
+            }
+
+            /* Shifted token offsets can be rebased when the retained image
+             * identity matches; changed pixels or a stale frontier cannot. */
+            ds4_vision_span image = {.token_start = 2,
+                .embedding = {.token_count = 2, .fingerprint = {7}}};
+            ds4_session_set_test_images(slot.session, &image, 1);
+            replay.images = calloc(1, sizeof(*replay.images));
+            replay.images[0] = image;
+            replay.images[0].token_start++;
+            replay.image_count = 1;
+            TEST_ASSERT(!ds4_session_vision_prefix_matches(slot.session, replay.images, 1));
+            TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &replay).kind == REUSE_RESPONSES_TOOL_OUTPUT);
+            TEST_ASSERT(ds4_session_rebase_vision_state(slot.session, replay.images, 1));
+            TEST_ASSERT(replay.images[0].token_start == image.token_start);
+            replay.images[0].embedding.fingerprint[0] = 8;
+            TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &replay).kind == REUSE_NONE);
+            replay.images[0].embedding.fingerprint[0] = 7;
+            slot.responses_live.live_tokens = 9;
+            TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &replay).kind == REUSE_NONE);
+            slot.responses_live.live_tokens = 10;
+            ds4_session_set_test_images(slot.session, NULL, 0);
+            request_free(&replay);
+        }
+
+        /* Ordinary user input without a result must not acquire an ID tier.
+         * Nor may a suffix hide a later assistant turn or changed system. */
+        buf_printf(&in, "[%s,%s,%s]", sys_pi, user_list, notification);
+        prepare_qwen_responses_turn(&replay, in.ptr, tools_a);
+        buf_free(&in);
+        TEST_ASSERT(replay.full_input_key != NULL && replay.tool_parent_key == NULL);
+        TEST_ASSERT(replay.responses_live_call_ids.len == 0);
+        TEST_ASSERT(probe_qwen_tool_replay(&s, &slot, &replay).kind == REUSE_NONE);
+        request_free(&replay);
+        const char *barriers[] = {asst_dir, sys_other};
+        for (size_t i = 0; i < sizeof(barriers) / sizeof(barriers[0]); i++) {
+            buf_printf(&in, "[%s,%s,%s,%s,%s,%s]", sys_pi, user_list,
+                       pending, result, barriers[i], notification);
+            prepare_qwen_responses_turn(&replay, in.ptr, tools_a);
+            buf_free(&in);
+            TEST_ASSERT(replay.responses_live_call_ids.len == 0);
+            TEST_ASSERT(probe_qwen_tool_replay(&s, &slot, &replay).kind == REUSE_NONE);
+            request_free(&replay);
+        }
+
         /* A summary replaces the earlier history but keeps the pending
          * assistant and its id: the parent comparison must fail. */
-        buf_printf(&in, "[%s,%s,%s,%s]", sys_pi, user_summ, pending, result);
+        buf_printf(&in, "[%s,%s,%s,%s,%s]", sys_pi, user_summ, pending, result, notification);
         prepare_qwen_responses_turn(&replay, in.ptr, tools_a);
         buf_free(&in);
         TEST_ASSERT(!replay.tool_delta_only);
         TEST_ASSERT(qwen_tool_ids_match(&slot, &replay, false));
         TEST_ASSERT(replay.tool_parent_key != NULL);
-        TEST_ASSERT(strcmp(replay.tool_parent_key,
-                           frontier.full_input_key) != 0);
+        if (replay.tool_parent_key)
+            TEST_ASSERT(strcmp(replay.tool_parent_key,
+                               frontier.full_input_key) != 0);
         TEST_ASSERT(probe_qwen_tool_replay(&s, &slot, &replay).kind ==
                     REUSE_NONE);
         request_free(&replay);
@@ -18164,7 +18256,7 @@ static void test_slot_probe_tool_parent_guard(void) {
         buf_free(&in);
         publish_qwen_tool_frontier(&s, &slot, &frontier, false, "call_live");
 
-        buf_printf(&in, "[%s]", result);
+        buf_printf(&in, "[%s,%s]", result, notification);
         request delta;
         prepare_qwen_responses_turn(&delta, in.ptr, tools_a);
         buf_free(&in);
