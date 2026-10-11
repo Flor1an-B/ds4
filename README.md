@@ -159,6 +159,11 @@ cold prefill. Other model/backend image sessions are not supported yet.
 Saved conversations and traces may contain private information.
 
 Image sessions use KVC v2; old binaries reject them. Text sessions remain v1.
+The visual input's v2 identities use persistent volume UUIDs on macOS rather
+than mount device numbers, which can change after reboot. Model/encoder inode,
+size and modification time must still match; these are file identities, not
+content hashes. Legacy visual input v1 remains readable with its strict device
+check and needs explicit migration if its mount number changed.
 Explicit `/save` and `/strip` wait for file and directory durability; on macOS
 this includes `F_FULLFSYNC`. A failure after publication reports unconfirmed
 durability instead of claiming the old file was rolled back.

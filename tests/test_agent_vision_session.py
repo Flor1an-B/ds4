@@ -100,13 +100,14 @@ def session_metadata(path: Path, section_copy: Path | None = None) -> dict:
             require(not flags & 16 and start == size, 'Unexpected input in text-only cache')
             return row
         require(flags == 24, 'Vision cache must use exactly TITLE|INPUT flags')
-        vh = f.read(96)
-        require(len(vh) == 96 and vh[:4] == b'DS4V', 'Missing DS4V section')
+        vh = f.read(32)
+        require(len(vh) == 32 and vh[:4] == b'DS4V', 'Missing DS4V section')
         v, total, exact, count, n_embd, reserved = struct.unpack_from('<IQIIII', vh, 4)
-        require(v == 1 and reserved == 0 and exact == tokens and count > 0 and n_embd > 0,
+        header_bytes = 96 if v == 1 else 112
+        require(v in (1, 2) and reserved == 0 and exact == tokens and count > 0 and n_embd > 0,
                 'Invalid visual input header')
-        require(start+total == size and 100+exact*4 <= total, 'Invalid visual section bounds')
-        f.seek(start+96+exact*4)
+        require(start+total == size and header_bytes+4+exact*4 <= total, 'Invalid visual section bounds')
+        f.seek(start+header_bytes+exact*4)
         spans = []
         previous_end = 0
         for _ in range(count):
@@ -145,7 +146,7 @@ def session_metadata(path: Path, section_copy: Path | None = None) -> dict:
         finally:
             if destination: destination.close()
         require(crc & 0xffffffff == expected_crc, 'Visual input CRC mismatch')
-        row.update(image_count=count, n_embd=n_embd, spans=spans,
+        row.update(image_count=count, n_embd=n_embd, spans=spans, input_version=v,
                    input_section_bytes=total, input_sha256=digest.hexdigest(),
                    input_crc32=f'{expected_crc:08x}')
         return row

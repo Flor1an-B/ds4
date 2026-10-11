@@ -36,6 +36,8 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <copyfile.h>
+#include <sys/attr.h>
+#include <sys/mount.h>
 #elif defined(__linux__)
 #include <sys/xattr.h>
 #endif
@@ -123,6 +125,8 @@ typedef struct {
 typedef struct agent_bash_job agent_bash_job;
 typedef struct {
     uint64_t dev, ino, bytes, mtime_ns;
+    uint8_t volume_uuid[16];
+    bool legacy;
 } agent_file_identity;
 
 /* Runtime preference only; never part of saved session metadata. */
@@ -4809,24 +4813,62 @@ static bool agent_fp_remaining(FILE *fp, uint64_t *out) {
 /* The decoder's input is exact tokens plus the particular FP32 rows it saw.
  * Tokens intentionally also occur in the graph payload: /strip removes that
  * payload, not the input needed to rebuild it. Image files are not dependencies. */
-#define AGENT_INPUT_HEADER_BYTES 96u
-#define AGENT_INPUT_VERSION 1u
+#define AGENT_INPUT_HEADER_BYTES 112u
+#define AGENT_INPUT_VERSION 2u
+
+static bool agent_file_identity_has_uuid(const agent_file_identity *id) {
+    static const uint8_t zero[16];
+    return memcmp(id->volume_uuid, zero, sizeof(zero)) != 0;
+}
 
 static bool agent_file_identity_read(const char *path, agent_file_identity *out) {
     struct stat st;
-    if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (!path) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd); return false;
+    }
 #ifdef __APPLE__
     uint64_t ns = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + st.st_mtimespec.tv_nsec;
 #else
     uint64_t ns = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + st.st_mtim.tv_nsec;
 #endif
-    *out = (agent_file_identity){st.st_dev, st.st_ino, st.st_size, ns};
+    agent_file_identity id = {.dev = st.st_dev, .ino = st.st_ino,
+                              .bytes = st.st_size, .mtime_ns = ns};
+#ifdef __APPLE__
+    /* st_dev identifies a mount, not a persistent volume: APFS can assign a
+     * different number after reboot. Keep the full volume UUID in archives. */
+    struct statfs fs;
+    struct attrlist attrs = {.bitmapcount = ATTR_BIT_MAP_COUNT,
+                            .volattr = ATTR_VOL_INFO | ATTR_VOL_UUID};
+    struct { uint32_t bytes; uint8_t uuid[16]; } volume = {0};
+    if (fstatfs(fd, &fs) ||
+        getattrlist(fs.f_mntonname, &attrs, &volume, sizeof(volume), 0) ||
+        volume.bytes != sizeof(volume)) {
+        close(fd); return false;
+    }
+    memcpy(id.volume_uuid, volume.uuid, sizeof(id.volume_uuid));
+    if (!agent_file_identity_has_uuid(&id)) {
+        close(fd); return false;
+    }
+#else
+    /* Visual restore is Metal-only. Retain device identity for portable tests
+     * without claiming a persistent UUID on other filesystems. */
+    agent_le_put64(id.volume_uuid, id.dev);
+#endif
+    close(fd);
+    *out = id;
     return true;
 }
 
 static bool agent_file_identity_equal(const agent_file_identity *a,
                                        const agent_file_identity *b) {
-    return a->dev == b->dev && a->ino == b->ino &&
+    bool volume = a->legacy || b->legacy
+        ? a->dev == b->dev /* v1 archives retain their original strict check. */
+        : agent_file_identity_has_uuid(a) && agent_file_identity_has_uuid(b) &&
+          !memcmp(a->volume_uuid, b->volume_uuid, sizeof(a->volume_uuid));
+    return volume && a->ino == b->ino &&
            a->bytes == b->bytes && a->mtime_ns == b->mtime_ns;
 }
 
@@ -4890,16 +4932,30 @@ static bool agent_input_u32(agent_input_io *io, uint32_t *value) {
     return true;
 }
 
-static bool agent_input_identity(agent_input_io *io, agent_file_identity *id) {
-    uint8_t bytes[32];
+static bool agent_input_identity(agent_input_io *io, agent_file_identity *id,
+                                  uint32_t version) {
+    uint8_t bytes[40];
+    size_t prefix = version == 1 ? 8 : 16;
     if (io->writing) {
-        agent_le_put64(bytes, id->dev); agent_le_put64(bytes + 8, id->ino);
-        agent_le_put64(bytes + 16, id->bytes); agent_le_put64(bytes + 24, id->mtime_ns);
+        if (version == 1) agent_le_put64(bytes, id->dev);
+        else memcpy(bytes, id->volume_uuid, prefix);
+        agent_le_put64(bytes + prefix, id->ino);
+        agent_le_put64(bytes + prefix + 8, id->bytes);
+        agent_le_put64(bytes + prefix + 16, id->mtime_ns);
     }
-    if (!agent_input_bytes(io, bytes, sizeof(bytes))) return false;
+    if (!agent_input_bytes(io, bytes, prefix + 24)) return false;
     if (!io->writing) {
-        *id = (agent_file_identity){agent_le_get64(bytes), agent_le_get64(bytes + 8),
-                                  agent_le_get64(bytes + 16), agent_le_get64(bytes + 24)};
+        *id = (agent_file_identity){.ino = agent_le_get64(bytes + prefix),
+            .bytes = agent_le_get64(bytes + prefix + 8),
+            .mtime_ns = agent_le_get64(bytes + prefix + 16)};
+        if (version == 1) {
+            id->dev = agent_le_get64(bytes);
+            id->legacy = true;
+        }
+        else {
+            memcpy(id->volume_uuid, bytes, prefix);
+            if (!agent_file_identity_has_uuid(id)) return false;
+        }
     }
     return true;
 }
@@ -4970,7 +5026,9 @@ static bool agent_input_span_shape(const ds4_vision_span *span, uint32_t tokens,
 static bool agent_input_size(const agent_vision_input *input, uint64_t *out) {
     if (sizeof(float) != 4 || input->tokens.len <= 0 || !input->tokens.v ||
         input->n_embd == 0 || input->n_embd > 16384 || !input->image_count ||
-        input->image_count > (size_t)input->tokens.len || !input->images) return false;
+        input->image_count > (size_t)input->tokens.len || !input->images ||
+        !agent_file_identity_has_uuid(&input->model) ||
+        !agent_file_identity_has_uuid(&input->vision)) return false;
     uint64_t bytes = AGENT_INPUT_HEADER_BYTES + 4ull + (uint64_t)input->tokens.len * 4;
     uint64_t end = 0;
     for (size_t i = 0; i < input->image_count; i++) {
@@ -5000,7 +5058,8 @@ static bool agent_input_write(FILE *fp, const agent_vision_input *input,
     ds4_kvstore_le_put32(header + 24, input->n_embd);
     bool ok = agent_input_bytes(&io, header, sizeof(header));
     agent_file_identity model = input->model, vision = input->vision;
-    ok = ok && agent_input_identity(&io, &model) && agent_input_identity(&io, &vision);
+    ok = ok && agent_input_identity(&io, &model, AGENT_INPUT_VERSION) &&
+               agent_input_identity(&io, &vision, AGENT_INPUT_VERSION);
     for (int i = 0; ok && i < input->tokens.len; i++) {
         if (input->tokens.v[i] < 0) { ok = false; break; }
         uint32_t token = (uint32_t)input->tokens.v[i];
@@ -5033,8 +5092,10 @@ static bool agent_input_read(FILE *fp, agent_vision_input *out, uint32_t n_embd,
     uint32_t count = ds4_kvstore_le_get32(header + 16);
     uint32_t images = ds4_kvstore_le_get32(header + 20);
     uint32_t dim = ds4_kvstore_le_get32(header + 24);
-    uint64_t minimum = 100ull + (uint64_t)count * 4 + (uint64_t)images * 68;
-    if (memcmp(header, "DS4V", 4) || ds4_kvstore_le_get32(header + 4) != AGENT_INPUT_VERSION ||
+    uint32_t version = ds4_kvstore_le_get32(header + 4);
+    uint64_t minimum = (version == 1 ? 100ull : AGENT_INPUT_HEADER_BYTES + 4ull) +
+                       (uint64_t)count * 4 + (uint64_t)images * 68;
+    if (memcmp(header, "DS4V", 4) || (version != 1 && version != AGENT_INPUT_VERSION) ||
         ds4_kvstore_le_get32(header + 28) || size != available || size < minimum ||
         !count || count > max_tokens || count > INT_MAX || !images || images > count ||
         !dim || dim > 16384 || (n_embd && dim != n_embd) || sizeof(float) != 4) goto invalid;
@@ -5042,7 +5103,8 @@ static bool agent_input_read(FILE *fp, agent_vision_input *out, uint32_t n_embd,
     agent_vision_input input = {.n_embd = dim, .image_count = images};
     agent_input_io io = {fp, size - 4, UINT32_MAX, false};
     if (!agent_input_bytes(&io, header, sizeof(header)) ||
-        !agent_input_identity(&io, &input.model) || !agent_input_identity(&io, &input.vision)) goto failed;
+        !agent_input_identity(&io, &input.model, version) ||
+        !agent_input_identity(&io, &input.vision, version)) goto failed;
     input.tokens.v = calloc(count, sizeof(input.tokens.v[0]));
     input.images = calloc(images, sizeof(input.images[0]));
     if (!input.tokens.v || !input.images) goto failed;
