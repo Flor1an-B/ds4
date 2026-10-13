@@ -15732,12 +15732,18 @@ decode_again:
                                             parsed_content :
                                             (parsed_calls.raw_tool_text ?
                                              parsed_calls.raw_tool_text : "");
+        /* final_finish, not finish: a tool call recovered from content after a
+         * natural EOS (finish=="stop") is still promoted to "tool_calls" only in
+         * final_finish (see the final_finish = "tool_calls" assignment above) --
+         * checking the pre-promotion finish here silently drops this turn's
+         * visible checkpoint, forcing every continuation back to a disk-text
+         * rebuild even though the turn is a perfectly good tool-call frontier. */
         bool checkpoint_remembered = remember_tool_turn_visible_checkpoint(
-                s, slot, j, ctx_span, finish, thinking.inside,
+                s, slot, j, ctx_span, final_finish, thinking.inside,
                 qwen_tool_turn_content,
                 &parsed_calls);
         if (!checkpoint_remembered &&
-            glm_tool_turn_checkpoint_eligible(&j->req, finish, thinking.inside,
+            glm_tool_turn_checkpoint_eligible(&j->req, final_finish, thinking.inside,
                                               glm_tool_turn_content))
         {
             /* GLM has no raw-DSML replay path (should_canonicalize_tool_checkpoint
