@@ -51860,6 +51860,7 @@ static bool glm_graph_mtp_step(
         int                next_token,
         uint32_t           pos,
         uint32_t           min_pos,
+        bool               need_output,
         int               *draft_out) {
     if (!g || !model || !weights || !draft_out) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
@@ -52063,6 +52064,25 @@ static bool glm_graph_mtp_step(
                                                      DS4_N_KV_LORA,
                                                      DS4_N_ROT,
                                                      glm_graph_compact_cache_is_f16()) != 0;
+    /* Headless catch-up: this call's only purpose is advancing the MTP
+     * KV cache at `pos` (just written by kv_store above) so a later call
+     * can attend over it. Nothing past this point (q/attention/FFN/head)
+     * feeds any state that outlives this function when the caller is
+     * going to discard *draft_out anyway - skip it, matching llama.cpp's
+     * headless-graph pruning for the same no-output MTP forward. */
+    if (ok && !need_output) {
+        DS4_GLM_MTP_STAGE("end");
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        ds4_gpu_tensor_free(enorm_view);
+        ds4_gpu_tensor_free(hnorm_view);
+        if (!ok) {
+            fprintf(stderr, "ds4: glm mtp step failed at stage '%s' (pos %u)\n",
+                    mtp_stage, pos);
+            return false;
+        }
+        return true;
+    }
     DS4_GLM_MTP_STAGE("qk_low");
     if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(g->qk_low,
                                                      g->q,
@@ -74470,7 +74490,7 @@ static int ds4_session_glm_spec_cycle_impl(
         int d = -1;
         s->glm_mtp_have = 0;
         if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &d)) {
+                               s->glm_mtp_min_pos, true, &d)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
@@ -74643,13 +74663,13 @@ static int ds4_session_glm_spec_cycle_impl(
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+                               s->glm_mtp_min_pos, false, &dummy) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
-                               s->glm_mtp_min_pos, &nd);
+                               s->glm_mtp_min_pos, true, &nd);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n2;
@@ -74709,6 +74729,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                    next,
                                    pos + 1u,
                                    s->glm_mtp_min_pos,
+                                   true,
                                    &nd)) {
                 s->glm_mtp_draft = nd;
                 s->glm_mtp_parent = next;
@@ -74726,7 +74747,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                  hc_row_bytes) != 0;
         const bool cu = !exact_sampling && hidden_ready &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &nd);
+                               s->glm_mtp_min_pos, true, &nd);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n1;
@@ -78424,7 +78445,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (probe_min_pos == UINT32_MAX) probe_min_pos = pos;
             int draft = -1;
             if (glm_graph_mtp_step(&s->glm_graph, &e->model, &e->weights,
-                                   nmax, pos, probe_min_pos, &draft)) {
+                                   nmax, pos, probe_min_pos, true, &draft)) {
                 probe_draft = draft;
                 probe_have = 1;
             } else {
