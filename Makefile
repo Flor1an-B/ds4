@@ -907,6 +907,12 @@ tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4
 tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_tokenizer.o: tests/test_tokenizer.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_tokenizer: tests/test_tokenizer.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
 
@@ -942,8 +948,9 @@ tests/test_tp_tcp: tests/test_tp_tcp.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 .PHONY: test-session-state
-test-session-state: tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
+test-session-state: tests/test_session_state tests/test_tokenizer tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	./tests/test_session_state
+	./tests/test_tokenizer
 	./tests/test_tp_commands
 	./tests/test_tp_rdma
 	./tests/test_tp_tcp
@@ -1108,7 +1115,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
 ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
-tests/test_session_state_gpu.o: ds4_tool_text.h
+tests/test_session_state_gpu.o tests/test_tokenizer.o: ds4_tool_text.h
 
 clean:
 	rm -f tests/test_qwen4_ngrams
@@ -1136,8 +1143,9 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache tests/test_engram
-	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
-	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
+	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tokenizer tests/test_tp_commands
+	rm -f tests/test_deepseek_indexer
+	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_glm_mixed_cache tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
