@@ -17948,7 +17948,7 @@ static void publish_qwen_tool_frontier(server *s, server_slot *slot,
     tc.arguments = xstrdup("{\"command\":\"ls\"}");
     tool_calls_push(&calls, tc);
     if (anthropic) anthropic_live_remember(s, slot, &calls, req);
-    else responses_live_remember(s, slot, "qwen visible frontier", &calls, req);
+    else responses_live_remember(s, slot, "qwen visible frontier", NULL, &calls, req);
     tool_calls_free(&calls);
 }
 
@@ -23200,7 +23200,7 @@ static void test_qwen_responses_final_replay_visible_frontier(void) {
             const char *p = "[{\"role\":\"user\",\"content\":\"See <M-OLD>\"}]";
             chat_msgs msgs = {0};
             TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
-            r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode, true);
             chat_msgs_free(&msgs);
             responses_live_remember_turn(&s, &slot, &r, answer, reasoning, NULL);
             TEST_ASSERT((slot.responses_live.visible_reasoning_text != NULL) == !!emit_summary);
@@ -23221,7 +23221,7 @@ static void test_qwen_responses_final_replay_visible_frontier(void) {
                 request next;
                 request_init(&next, REQ_CHAT, 128);
                 next.api = API_RESPONSES;
-                next.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+                next.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode, true);
                 next.images = calloc(1, sizeof(*next.images));
                 next.images[0] = old_image;
                 next.images[0].token_start++;  /* drift, not changed image pixels */
