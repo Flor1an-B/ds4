@@ -22778,7 +22778,7 @@ static void test_anthropic_live_tail_keeps_system_note(void) {
         top.role = xstrdup("system");
         top.content = xstrdup("You are terse.");
         anthropic_place_system_prompt(&msgs, top, r.model_syntax);
-        anthropic_prepare_live_continuation(&s, &r, &msgs);
+        anthropic_prepare_live_continuation(&s, &r, &msgs, NULL);
         char *full = render_chat_prompt_text_for_syntax(r.model_syntax, &msgs, NULL, NULL,
                                                         r.think_mode);
         const char *tail = r.anthropic_live_suffix_text;
