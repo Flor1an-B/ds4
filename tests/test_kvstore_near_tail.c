@@ -115,6 +115,17 @@ char *ds4_token_text(ds4_engine *e,int id,size_t *n){
     *n=1;
     return p;
 }
+const char *ds4_token_bytes(ds4_engine *e,int id,size_t *n){
+    (void)e;
+    static const char letters[26][2]={
+        "a","b","c","d","e","f","g","h","i","j","k","l","m",
+        "n","o","p","q","r","s","t","u","v","w","x","y","z"};
+    if(n)*n=1;
+    return letters[((id%26)+26)%26];
+}
+void ds4_tokens_append(ds4_tokens *dst,const ds4_tokens *src){
+    for(int i=0;i<src->len;i++)ds4_tokens_push(dst,src->v[i]);
+}
 void ds4_tokenize_rendered_chat(ds4_engine *e,const char *s,ds4_tokens *t){
     (void)e;
     for(;*s;s++)ds4_tokens_push(t,(unsigned char)*s);
@@ -214,7 +225,7 @@ static bool growing_trailer_write(void *ud, FILE *fp, const char *text,
 
 static bool store(ds4_kvstore *k,ds4_engine *e,ds4_session *s,const char *text,const char *why){
     char err[160];
-    return ds4_kvstore_store_live_prefix_text(k,e,s,&s->tokens,s->tokens.len,why,text,DS4_KVSTORE_EXT_RESPONSES_VISIBLE,"responses-prompt",NULL,err,sizeof(err));
+    return ds4_kvstore_store_live_prefix_text(k,e,s,&s->tokens,s->tokens.len,why,text,DS4_KVSTORE_EXT_RESPONSES_VISIBLE,"responses-prompt",NULL,NULL,err,sizeof(err));
 }
 static char *key_path(ds4_kvstore *k,const char *text){
     char sha[41];
@@ -341,7 +352,7 @@ int main(void){
     stages=stage_calls;
     assert(!ds4_kvstore_store_live_prefix_text(&k,&e,&s,&s.tokens,s.tokens.len,
         "near-tail","growing-trailer",DS4_KVSTORE_EXT_RESPONSES_VISIBLE,
-        "responses-prompt",&growing,trailer_err,sizeof(trailer_err)));
+        "responses-prompt",NULL,&growing,trailer_err,sizeof(trailer_err)));
     char *grown_path=key_path(&k,"growing-trailer");
     assert(stage_calls==stages+1&&access(grown_path,F_OK)&&!access(ordinary,F_OK));
     free(grown_path);

@@ -170,7 +170,8 @@ int main(int argc, char **argv) {
     const char *key = "Qwen synthetic visible prefix";
     check(ds4_kvstore_store_live_prefix_text(&store, engine, session,
           &frontier, frontier.len, "near-tail", key,
-          DS4_KVSTORE_EXT_RESPONSES_VISIBLE, "responses-prompt", &hooks, err, sizeof(err)), err);
+          DS4_KVSTORE_EXT_RESPONSES_VISIBLE, "responses-prompt", NULL, &hooks,
+          err, sizeof(err)), err);
     logits(session, b, vocab);
     check(!memcmp(start, b, row_bytes), "save changed logits");
     check(ds4_tokens_starts_with(ds4_session_tokens(session), &frontier) &&
