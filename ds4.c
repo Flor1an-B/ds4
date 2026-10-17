@@ -81358,6 +81358,10 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             } else {
                 memcpy(s->logits, rows, (size_t)V * sizeof(float));
                 g->pos = pos0[i] + 1u;
+                if (qwen4_spec_trace()) {
+                    fprintf(stderr, "ds4: spec batch pos %u token %d plain (no draft ready)\n",
+                            pos0[i], mem[i].tokens[0]);
+                }
             }
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
