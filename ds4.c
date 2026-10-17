@@ -80898,7 +80898,7 @@ static bool ds41_mixed_batch_supported(ds4_decode_item *items, int count,
         rows > DS4_TP_BATCH_MAX_ROWS - count || ds4_session_cancelled(prefill)) return false;
     ds4_decode_item combined[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; i < rows; i++)
-        combined[i] = (ds4_decode_item){prefill, prompt->v[prefill->checkpoint.len + i]};
+        combined[i] = (ds4_decode_item){.session = prefill, .token = prompt->v[prefill->checkpoint.len + i]};
     for (int i = 0; i < count; i++) {
         if (ds4_session_cancelled(items[i].session)) return false;
         combined[rows + i] = items[i];
@@ -81294,9 +81294,46 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             }
             token_vec_push(&s->checkpoint, mem[i].tokens[0]);
             committed[i] = 1u;
+            /* RESEARCH PROTOTYPE (research-mtp-batched-exact): the batched
+             * Qwen4 path historically only ever did opportunistic
+             * (argmax-match) acceptance -- exact rejection sampling existed
+             * only in the non-batched ds4_session_qwen4_spec_cycle(). With
+             * --mtp-exact-sampling and temperature>0 this made the server's
+             * batched-session speculative branch refuse to engage at all
+             * (see ds4_server.c gating, now relaxed). This block ports the
+             * same point-mass rejection-sampling math (speculative_point_accept
+             * / speculative_point_replacement, identical to the non-batched
+             * path) per session, using each item's own sampler/rng -- the
+             * logits are already host-resident per session at this point, so
+             * no new Metal kernel or cross-session synchronization is needed. */
+            const bool exact = ds4_engine_mtp_exact_sampling(e) &&
+                               items[i].temperature > 0.0f && items[i].rng;
+            if (exact && !s->sample_probs) {
+                s->sample_probs = xmalloc((size_t)V * sizeof(s->sample_probs[0]));
+            }
+            int replacement = -1;
             if (mem[i].n == 2u) {
                 s->qwen4_spec_cycles++;
-                const bool accept = sample_argmax(rows, V) == mem[i].tokens[1] || qwen4_spec_force_accept();
+                bool accept;
+                if (exact) {
+                    if (!sample_build_probabilities(rows, V, items[i].temperature, items[i].top_k,
+                                                    items[i].top_p, items[i].min_p, s->sample_probs)) {
+                        for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
+                        if (err && errlen) snprintf(err, errlen, "Qwen3.8 mtp: target distribution failed");
+                        return 1;
+                    }
+                    accept = speculative_point_accept(s->sample_probs[mem[i].tokens[1]], 1.0f, items[i].rng);
+                    if (!accept) {
+                        replacement = speculative_point_replacement(s, mem[i].tokens[1], items[i].rng);
+                        if (replacement < 0) {
+                            for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
+                            if (err && errlen) snprintf(err, errlen, "Qwen3.8 mtp: replacement sampling failed");
+                            return 1;
+                        }
+                    }
+                } else {
+                    accept = sample_argmax(rows, V) == mem[i].tokens[1] || qwen4_spec_force_accept();
+                }
                 qwen4_spec_note_first_draft(s, accept);
                 n_draft++;
                 n_acc += accept;
@@ -81315,8 +81352,8 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                     memcpy(s->logits, rows, (size_t)V * sizeof(float));
                 }
                 if (qwen4_spec_trace()) {
-                    fprintf(stderr, "ds4: spec batch pos %u token %d draft %d %s\n", pos0[i], mem[i].tokens[0],
-                            mem[i].tokens[1], accept ? "accept" : "reject");
+                    fprintf(stderr, "ds4: spec batch pos %u token %d draft %d %s%s\n", pos0[i], mem[i].tokens[0],
+                            mem[i].tokens[1], accept ? "accept" : "reject", exact ? " (exact)" : "");
                 }
             } else {
                 memcpy(s->logits, rows, (size_t)V * sizeof(float));
@@ -81325,7 +81362,21 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             s->qwen4_rewound = false;
-            parents[i] = sample_argmax(s->logits, V);
+            /* Exact mode: the parent fed to the next draft must be the exact
+             * token ds4_session_sample() will emit next (held via
+             * qwen4_spec_hold_next), not a greedy guess -- otherwise the next
+             * draft is conditioned on a token that is not what actually gets
+             * emitted, as in the non-batched qwen4_spec_next_parent(). On a
+             * rejection, that next token is the residual replacement sampled
+             * above, not a fresh sample from s->logits. */
+            if (exact && replacement >= 0) {
+                qwen4_spec_hold_next(s, replacement, items[i].temperature, items[i].top_k,
+                                     items[i].top_p, items[i].min_p);
+                parents[i] = replacement;
+            } else {
+                parents[i] = qwen4_spec_next_parent(s, exact, items[i].temperature, items[i].top_k,
+                                                    items[i].top_p, items[i].min_p, items[i].rng);
+            }
             n_accepted[i] = (int)committed[i];
             accepted[i][0] = mem[i].tokens[0];
             accepted[i][1] = committed[i] == 2u ? mem[i].tokens[1] : -1;

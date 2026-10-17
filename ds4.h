@@ -558,6 +558,14 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 typedef struct {
     ds4_session *session;
     int token;
+    /* Exact-sampling speculative batch only: the issuing request's sampler,
+     * so a rejected draft's residual token comes from the same distribution
+     * the non-batched path uses. Unused (and harmless) outside that path. */
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    uint64_t *rng;
 } ds4_decode_item;
 
 /* Advance independent sessions by one token each. Batch size one is exactly
