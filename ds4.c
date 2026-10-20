@@ -60197,11 +60197,54 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* The F32 router rows are widened BF16: every value has zero low 16 bits.
+ * Single-token routing reads a BF16 copy - half the bytes, identical values,
+ * identical products and sums.  Built on first use per tensor and kept for
+ * the process; a tensor with any non-BF16 value keeps the F32 path. */
+#ifdef DS4_HAS_QWEN4_METAL
+static const ds4_gpu_tensor *qwen4_bf16_weights(const ds4_model *m, const ds4_tensor *w) {
+    static struct { const void *map; uint64_t off; ds4_gpu_tensor *t; bool bad; } cache[2u * DS4_MAX_LAYER];
+    if (w->type != DS4_TENSOR_F32 || w->ndim != 2 || getenv("DS4_QWEN4_NO_BF16_ROUTER")) return NULL;
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < 2u * DS4_MAX_LAYER; i++) {
+        if (cache[i].map == m->map && cache[i].off == w->abs_offset) return cache[i].bad ? NULL : cache[i].t;
+        if (slot == UINT32_MAX && !cache[i].map) slot = i;
+    }
+    if (slot == UINT32_MAX) return NULL;
+    const uint64_t n = w->dim[0] * w->dim[1];
+    const uint32_t *src = (const uint32_t *)((const uint8_t *)m->map + w->abs_offset);
+    uint16_t *bf = malloc(n * sizeof(uint16_t));
+    bool exact = bf != NULL;
+    for (uint64_t i = 0; exact && i < n; i++) {
+        exact = (src[i] & 0xffffu) == 0;
+        bf[i] = (uint16_t)(src[i] >> 16);
+    }
+    ds4_gpu_tensor *t = exact ? ds4_gpu_tensor_alloc(n * sizeof(uint16_t)) : NULL;
+    if (t && !ds4_gpu_tensor_write(t, 0, bf, n * sizeof(uint16_t))) {
+        ds4_gpu_tensor_free(t);
+        t = NULL;
+    }
+    free(bf);
+    cache[slot].map = m->map;
+    cache[slot].off = w->abs_offset;
+    cache[slot].t = t;
+    cache[slot].bad = t == NULL;
+    return t;
+}
+#endif
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
+#ifdef DS4_HAS_QWEN4_METAL
+    const ds4_gpu_tensor *router_bf16 = T == 1u ? qwen4_bf16_weights(m, l->ffn_gate_inp) : NULL;
+    bool ok = (router_bf16 ? ds4_gpu_matmul_bf16_weights_tensor(g->router, router_bf16, (uint32_t)l->ffn_gate_inp->dim[0],
+                                                                (uint32_t)l->ffn_gate_inp->dim[1], g->mixed) != 0
+                           : qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T)) &&
+#else
     bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
+#endif
               ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&

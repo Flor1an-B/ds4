@@ -3642,6 +3642,8 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */
+int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
+                                       uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 int ds4_gpu_qwen4_moe_down_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights, const ds4_gpu_tensor *shared_gate, ds4_gpu_tensor *R,
