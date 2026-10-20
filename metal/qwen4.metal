@@ -3159,6 +3159,80 @@ kernel void kernel_qwen4_moe_mid(
     }
 }
 
+/* IQ2_XXS routed gate/up rows: qwen4_row_dot's type-16 lane map and
+ * per-lane accumulation order, with the grid and sign tables staged in
+ * threadgroup memory; lanes index them divergently, which serializes in the
+ * constant address space.  The shared slot keeps the generic row dot. */
+static inline float qwen4_iq2xxs_row_dot_tg(device const char *row, device const float *x, uint in_dim,
+                                            ushort tiisg, threadgroup const uint64_t *sgrid,
+                                            threadgroup const uchar *ssigns) {
+    float acc = 0.0f;
+    const uint nb = in_dim / 256;
+    const uint ib32 = tiisg / 4, j = tiisg % 4;
+    for (uint ib = 0; ib < nb; ib++) {
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 66);
+        const float d = (float)(*(device const half *)blk);
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
+        const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+        const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+        threadgroup const uchar *grid = (threadgroup const uchar *)(sgrid + ((aux_g >> (8 * j)) & 0xFFu));
+        const uint signs = ssigns[(aux_s >> (7 * j)) & 127u];
+        device const float *y = x + ib * 256 + ib32 * 32 + j * 8;
+        float part = 0.0f;
+        for (uint i = 0; i < 8; i++) part += (float)grid[i] * ((signs >> i) & 1u ? -y[i] : y[i]);
+        acc += dl * part;
+    }
+    return simd_sum(acc);
+}
+
+kernel void kernel_qwen4_moe_mid_iq2xxs(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    threadgroup uint64_t sgrid[256];
+    threadgroup uchar ssigns[128];
+    const uint slot = tgpig.y;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    if (slot >= n_out || tok >= args.n_tokens) return;
+    const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 2u;
+    const uint dim = is_function_constant_defined(qwen4_mv_dim) ? qwen4_mv_dim : args.in_dim;
+    const uint st = is_function_constant_defined(qwen4_mv_shared_type) ? qwen4_mv_shared_type : args.shared_type;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * nr;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    if (slot == args.n_slots) {
+        for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, st, dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, st, dim, tiisg);
+            if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
+        }
+        return;
+    }
+    for (uint i = (uint)sgitg * 32u + tiisg; i < 256u; i += ntg.x) {
+        sgrid[i] = ds4_metal_iq2xxs_grid[i];
+        if (i < 128u) ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint64_t ebase = (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+        const uint64_t off = ebase + (uint64_t)r * args.row_bytes;
+        const float g = qwen4_iq2xxs_row_dot_tg(gate_base + off, xt, dim, tiisg, sgrid, ssigns);
+        const float u = qwen4_iq2xxs_row_dot_tg(up_base + off, xt, dim, tiisg, sgrid, ssigns);
+        if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
+    }
+}
+
 /* Q4_K gate/up input reuse with the original qwen4_row_dot lane mapping
  * and accumulation order.  Each lane still visits every block in order and
  * adds its eight elements individually; only independent rows/projections
