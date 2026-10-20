@@ -48471,11 +48471,11 @@ typedef struct {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra and M5 use low-bit and MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
+        (type == 16u || type == 10u || type == 39u) &&
+        (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon());
 }
 
 static uint32_t qwen4_moe_mv_rows(void) {
