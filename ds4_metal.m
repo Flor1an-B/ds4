@@ -48680,6 +48680,27 @@ void ds4_gpu_qwen4_prefetch_next(const void *map, uint64_t size, uint64_t offset
     g_qwen4_pf_map = map; g_qwen4_pf_size = size; g_qwen4_pf_off = offset; g_qwen4_pf_bytes = bytes;
 }
 
+#define QWEN4_PREFETCH_MAGIC 0x9E3779B9u
+/* Consume the pending range: bind it and the sink, return its line count
+ * (0 and a harmless binding when nothing is pending). */
+static uint32_t qwen4_take_prefetch(qwen4_bind *pf, qwen4_bind *sink) {
+    static id<MTLBuffer> sink_buf;
+    if (!sink_buf) sink_buf = [g_device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+    sink->buf = sink_buf;
+    sink->off = 0;
+    pf->buf = sink_buf;
+    pf->off = 0;
+    const uint64_t bytes = g_qwen4_pf_bytes;
+    g_qwen4_pf_bytes = 0;
+    if (!sink_buf || bytes < 128u ||
+        !qwen4_bind_weight(pf, g_qwen4_pf_map, g_qwen4_pf_size, g_qwen4_pf_off, bytes, "prefetch")) {
+        pf->buf = sink_buf;
+        pf->off = 0;
+        return 0;
+    }
+    return (uint32_t)(bytes / 128u);
+}
+
 int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
@@ -48721,21 +48742,13 @@ int ds4_gpu_qwen4_hc_norm_tensor(
     const int kernel = reuse
         ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
-    uint32_t pf_tgs = 0;
-    static id<MTLBuffer> pf_sink;
-    if (!pf_sink) pf_sink = [g_device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
-    b[5] = b[0];
-    b[6].buf = pf_sink;
-    b[6].off = 0;
-    if (!reuse && n_tokens == 1u && pf_sink && g_qwen4_pf_bytes >= 128u &&
-        qwen4_bind_weight(&b[5], g_qwen4_pf_map, g_qwen4_pf_size, g_qwen4_pf_off, g_qwen4_pf_bytes, "prefetch")) {
-        /* 32 groups measured best on M5 Max for the 6.5 MB hc projections. */
-        pf_tgs = 32u;
-        args.pad0 = (uint32_t)(g_qwen4_pf_bytes / 128u);
-        args.pad1 = pf_tgs * 128u;
-        args.pad2 = 0x9E3779B9u;
-    }
-    g_qwen4_pf_bytes = 0;
+    /* 32 groups measured best on M5 Max for the 6.5 MB hc projections. */
+    uint32_t lines = qwen4_take_prefetch(&b[5], &b[6]);
+    if (reuse || n_tokens != 1u) lines = 0;
+    const uint32_t pf_tgs = lines ? 32u : 0u;
+    args.pad0 = lines;
+    args.pad1 = pf_tgs * 128u;
+    args.pad2 = QWEN4_PREFETCH_MAGIC;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS + pf_tgs, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }

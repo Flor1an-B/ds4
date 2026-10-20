@@ -62,6 +62,18 @@ struct qwen4_w_q8 {
     }
 };
 
+/* Extra threadgroups of a latency-bound decode kernel pull the next
+ * bandwidth-bound dispatch's weights into the system cache while DRAM is
+ * otherwise idle: one load per 128-byte line, reads only.  The sink store
+ * needs a line whose words XOR to `magic`; it only keeps the loads live. */
+static inline void qwen4_prefetch_lines(device const uint4 *pf, device uint *sink, uint n_lines, uint magic,
+                                        uint first, uint stride) {
+    for (uint l = first; l < n_lines; l += stride) {
+        const uint4 v = pf[(uint64_t)l * 8u];
+        if ((v.x ^ v.y ^ v.z ^ v.w) == magic) sink[0] = l;
+    }
+}
+
 /* Grouped RMSNorm of one (stream chunk, token): xn = R * rsqrt(mean(R^2)
  * + eps) * gamma over the chunk, plus the chunk's partial dot with each
  * inject row (consumers sum the hc*chunks partials and apply
@@ -85,15 +97,9 @@ kernel void kernel_qwen4_hc_norm(
     const uint chunk = tgpig.x % QWEN4_HC_CHUNKS;
     const uint tok = tgpig.y;
     if (args.pad0 && s >= args.n_hc && tok == 0) {
-        /* Threadgroups past the norm groups pull the low-rank projection's
-         * weights into the system cache: the norm is latency-bound and
-         * leaves DRAM idle, the projection after it is bandwidth-bound.
-         * One load per line; reads only. */
-        const uint line = (tgpig.x - args.n_hc * QWEN4_HC_CHUNKS) * ntg.x + tid;
-        for (uint l = line; l < args.pad0; l += args.pad1) {
-            const uint4 v = pf[(uint64_t)l * 8u];
-            if ((v.x ^ v.y ^ v.z ^ v.w) == args.pad2) sink[0] = l;
-        }
+        /* the low-rank projection's weights (qwen4_prefetch_lines) */
+        qwen4_prefetch_lines(pf, sink, args.pad0, args.pad2,
+                             (tgpig.x - args.n_hc * QWEN4_HC_CHUNKS) * ntg.x + tid, args.pad1);
         return;
     }
     if (s >= args.n_hc || tok >= args.n_tokens) return;
