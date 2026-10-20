@@ -3511,6 +3511,57 @@ kernel void kernel_qwen4_moe_down(
     }
 }
 
+/* Single-token routed down rows with the weighted reduce folded in.  A
+ * threadgroup holds one simdgroup per slot (the shared expert last) over the
+ * same few output rows; each computes kernel_qwen4_moe_down's row dot, then
+ * one thread per row combines the slots exactly as kernel_qwen4_moe_reduce
+ * does and applies the hyper-connection update. */
+#define QWEN4_DOWN_REDUCE_ROWS 4
+kernel void kernel_qwen4_moe_down_reduce(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,     /* [n_slots] */
+        device const float   *mid,          /* [n_slots+1][in_dim] */
+        device const char    *sh_down,
+        device const float   *weights,      /* [n_slots] */
+        device const float   *shared_gate,  /* [1] raw logit */
+        device float         *out,          /* [out_rows] */
+        device float         *R,            /* [n_hc*out_rows] */
+        device const float   *inj,          /* [n_hc*chunks][n_hc] norm partials */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[17][QWEN4_DOWN_REDUCE_ROWS];
+    threadgroup float wgt[8];
+    const uint n_hc = args.pad0, ns = args.n_slots, slot = sgitg;
+    if (tid < n_hc) wgt[tid] = qwen4_hc_inject_weight(inj, n_hc, tid);
+    const uint dim = is_function_constant_defined(qwen4_mv_dim) ? qwen4_mv_dim : args.in_dim;
+    const uint wt = is_function_constant_defined(qwen4_mv_type) ? qwen4_mv_type : args.weight_type;
+    const uint st = is_function_constant_defined(qwen4_mv_shared_type) ? qwen4_mv_shared_type : args.shared_type;
+    const uint d0 = tgpig.x * QWEN4_DOWN_REDUCE_ROWS;
+    const bool shared = slot == ns;
+    device const char *db = shared ? sh_down :
+        down_base + (uint64_t)(uint)selected[slot] * args.expert_bytes;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    device const float *m = mid + (uint64_t)slot * args.in_dim;
+    for (uint r = 0; r < QWEN4_DOWN_REDUCE_ROWS; r++) {
+        const uint d = d0 + r;
+        if (d >= args.out_rows) break;
+        const float v = qwen4_row_dot(db + (uint64_t)d * row_bytes, m, shared ? st : wt, dim, tiisg);
+        if (tiisg == 0) part[slot][r] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < QWEN4_DOWN_REDUCE_ROWS && d0 + tid < args.out_rows) {
+        const uint d = d0 + tid;
+        float o = 0.0f;
+        for (uint s = 0; s < ns; s++) o += weights[s] * part[s][tid];
+        o += qwen4_sigmoid(shared_gate[0]) * part[ns][tid];
+        out[d] = o;
+        for (uint s = 0; s < n_hc; s++) R[s * args.out_rows + d] += wgt[s] * o;
+    }
+}
+
 /* MXFP4 routed down rows with four blocks per lane requested before the
  * accumulation chain.  The shipped qwen4_row_dot loop for type 39 compiles
  * to s = t0*y0 + t1*y1 + t2*y16 + t3*y17 (left to right), acc += s*d; that
