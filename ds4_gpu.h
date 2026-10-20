@@ -3644,6 +3644,7 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
  * token in part. */
 int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
                                        uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+void ds4_gpu_qwen4_prefetch_next(const void *map, uint64_t size, uint64_t offset, uint64_t bytes);
 int ds4_gpu_qwen4_moe_down_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights, const ds4_gpu_tensor *shared_gate, ds4_gpu_tensor *R,
