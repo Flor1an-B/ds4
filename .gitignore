@@ -124,3 +124,5 @@ __pycache__/
 
 /tests/test_kvstore_near_tail
 /tests/test_qwen4_prompt_checkpoint
+/tests/test_vision_state_restore
+/tests/test_kvstore_rewrite
