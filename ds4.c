@@ -41349,6 +41349,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
     X(block_mask, (g->ctx + 7u) / 8u) \
+    X(candidate_rows, 16384) X(compact_scores, 16384) \
+    X(compact_selected, DS4_N_INDEXER_TOP_K) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
     X(selected, DS4_N_EXPERT_USED) X(route_weights, DS4_N_EXPERT_USED) \
@@ -41374,6 +41376,9 @@ typedef struct {
     size_t image_count;
     ds4_engram_layout engram;
     ds4_engram_history history;
+    uint32_t candidate_count;
+    uint32_t candidate_pos;
+    bool candidate_decode;
     uint32_t *token_map;
     uint32_t (*prefill_ids)[2][DS4_ENGRAM_COLS];
     ds4_engram_table table[2];
@@ -41907,6 +41912,40 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+static int ds41_candidate_row_cmp(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Turn the layer-20 block selection into an ascending row list. Ascending
+ * order keeps the tie order of the full-index top-k, so the selected rows are
+ * the same ones the unfiltered path would keep. */
+static bool ds41_build_candidate_rows(ds41_gpu_graph *g, uint32_t n_comp, uint32_t top) {
+    uint32_t ids[2048];
+    if (top == 0u || top > 2048u) return false;
+    /* block_selected is produced in the current command buffer. */
+    if (!ds4_gpu_end_commands()) return false;
+    if (!ds4_gpu_tensor_read(g->block_selected, 0, ids,
+                             (uint64_t)top * sizeof(uint32_t))) return false;
+    qsort(ids, top, sizeof(uint32_t), ds41_candidate_row_cmp);
+    uint32_t rows[16384], n = 0;
+    for (uint32_t b = 0; b < top; b++) {
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t row = ids[b] * 8u + j;
+            if (row >= n_comp) continue;
+            if (n >= 16384u) return false;
+            rows[n++] = row;
+        }
+    }
+    if (n == 0u) return false;
+    if (!ds4_gpu_tensor_write(g->candidate_rows, 0, rows,
+                              (uint64_t)n * sizeof(uint32_t))) return false;
+    g->candidate_count = n;
+    g->candidate_pos = g->pos;
+    if (!ds4_gpu_begin_commands()) return false;
+    return true;
+}
+
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -41919,6 +41958,9 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
+            if (g->candidate_decode &&
+                getenv("DS4_V41_DISABLE_CANDIDATE_SCORING") == NULL &&
+                !ds41_build_candidate_rows(g, n_comp, top)) return false;
         } else if (il > 20 &&
             !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)) return false;
     }
@@ -41942,12 +41984,23 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+        if (il > 20u && g->candidate_decode && g->candidate_count > 0u &&
+            g->candidate_pos == g->pos) {
+            if (!ds4_gpu_glm_indexer_score_rows_tensor(g->compact_scores, g->index_q,
+                    g->index_weights, g->index_cache[owner], g->candidate_rows,
+                    n_comp, g->candidate_count, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f) ||
+                !ds4_gpu_indexer_topk_tensor(g->compact_selected, g->compact_scores,
+                    g->candidate_count, 1, DS4_N_INDEXER_TOP_K) ||
+                !ds4_gpu_indexer_map_rows_tensor(g->selected_comp, g->candidate_rows,
+                    g->compact_selected, DS4_N_INDEXER_TOP_K)) return false;
+            return true;
+        }
+        if (!ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else
-            !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+        if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
     }
@@ -42629,6 +42682,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     uint32_t ids[2][DS4_ENGRAM_COLS];
+    g->candidate_count = 0;
+    g->candidate_pos = UINT32_MAX;
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     const bool overlap_engram = g->engram_reader && !ds41_image_at(g, g->pos) &&
@@ -42650,8 +42705,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+    /* Single-host decode would pay a full wait per layer. Committing each
+     * layer's command buffer without waiting keeps the GPU queue fed while
+     * the CPU encodes the next layer; the drains at layer 13 (Engram table
+     * handoff) and at the final layer bound the queue and preserve the buffer
+     * hazards. The disable switch exists for A/B measurements only. */
+#ifdef __APPLE__
+    const bool queue_single = g->tp_world != 2 && !g->streaming && !g->imatrix &&
+        getenv("DS4_METAL_DISABLE_V41_DECODE_PIPELINE") == NULL;
+#else
+    const bool queue_single = false;
+#endif
+    const bool queue_layers = (g->tp_world == 2 || queue_single) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* Set only once every early-exit path above is behind us. SSD streaming
+     * keeps full scoring: the compact path adds a CPU/GPU round trip that has
+     * not been exercised against the expert cache. */
+    g->candidate_decode = !g->streaming;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -42672,7 +42742,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
-        if (drain && !ds4_gpu_end_commands()) ok = false;
+        if (drain) {
+            if (!ds4_gpu_end_commands()) ok = false;
+        } else if (queue_single && !ds4_gpu_flush_commands()) {
+            ok = false;
+        }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -42689,9 +42763,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
     if (!ok) {
+        g->candidate_decode = false;
         g->valid = false;
         return false;
     }
+    g->candidate_decode = false;
     g->history = next_history;
     g->pos++;
     return true;
@@ -43434,6 +43510,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
+    /* Overlap CPU layer encoding with GPU execution for single-host batched
+     * decode. The Engram drain at layer 13 stays as it is; TP keeps its own
+     * command-buffer gating. SSD streaming is excluded: its expert cache is
+     * filled and evicted per layer, so a layer must not still be executing
+     * while the cache is reconfigured. Disable switch for A/B only. */
+#ifdef __APPLE__
+    const bool batch_queue = g->tp_world != 2 && !g->streaming &&
+        getenv("DS4_METAL_DISABLE_V41_BATCH_DECODE_PIPELINE") == NULL;
+#else
+    const bool batch_queue = false;
+#endif
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
@@ -43530,6 +43617,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        else if (ok && batch_queue && il + 1u < DS4_N_LAYER &&
+                 !ds4_gpu_flush_commands()) ok = false;
     }
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);

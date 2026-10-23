@@ -18793,7 +18793,7 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:(128u + 8u) * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -19051,10 +19051,19 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
             g_argsort_f32_i32_desc_pipeline;
+        /* Each merge run only needs to keep its top-k entries: a row outside
+         * a run's top-k cannot enter the global top-k. The prefix variants
+         * read just that many entries per run instead of the whole run, which
+         * is what makes top-k over a 1M-row decode cache affordable. */
+        const bool prefix_merge = top_k == 512u &&
+            !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX");
         id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
-            ds4_gpu_get_pipeline(top_k == 512u && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
+            ds4_gpu_get_pipeline(prefix_merge ?
                 "kernel_argsort_merge_f32_i32_desc_causal_prefix" :
-                "kernel_argsort_merge_f32_i32_desc_causal") : g_argsort_merge_f32_i32_desc_pipeline;
+                "kernel_argsort_merge_f32_i32_desc_causal") :
+            (prefix_merge ?
+                ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix") :
+                g_argsort_merge_f32_i32_desc_pipeline);
         if (!sort_pipeline || !merge_pipeline) return 0;
         const uint64_t score_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
         const uint64_t selected_bytes = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
@@ -36034,7 +36043,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
             [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:(128u + 8u) * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -36184,6 +36193,121 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer batch scores")) return 0;
     }
 
+    return 1;
+}
+
+int ds4_gpu_glm_indexer_score_rows_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        const ds4_gpu_tensor *rows,
+        uint32_t              visible_rows,
+        uint32_t              rows_count,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!scores || !q || !weights || !indexer_key_cache || !rows ||
+        visible_rows == 0 || rows_count == 0 ||
+        n_head != 32u || head_dim != 128u || !isfinite(scale) || scale <= 0.0f) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> scoresbuf = ds4_gpu_tensor_buffer(scores);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> cachebuf = ds4_gpu_tensor_buffer(indexer_key_cache);
+        id<MTLBuffer> rowsbuf = ds4_gpu_tensor_buffer(rows);
+        const uint64_t score_bytes = (uint64_t)rows_count * sizeof(float);
+        const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+        const uint64_t weights_bytes = (uint64_t)n_head * sizeof(float);
+        const uint64_t cache_bytes = (uint64_t)visible_rows * head_dim * sizeof(float);
+        const uint64_t rows_bytes = (uint64_t)rows_count * sizeof(uint32_t);
+        if (!scoresbuf || !qbuf || !weightsbuf || !cachebuf || !rowsbuf ||
+            ds4_gpu_tensor_bytes(scores) < score_bytes ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(weights) < weights_bytes ||
+            ds4_gpu_tensor_bytes(indexer_key_cache) < cache_bytes ||
+            ds4_gpu_tensor_bytes(rows) < rows_bytes) {
+            fprintf(stderr, "ds4: Metal GLM indexer row score received undersized buffers\n");
+            return 0;
+        }
+
+        ds4_gpu_glm_indexer_score_one_args args = {
+            .n_rows = visible_rows,
+            .n_head = n_head,
+            .head_dim = head_dim,
+            .cache_f16 = 0u,
+            .scale = scale,
+        };
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_indexer_score_rows");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+        [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
+        [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
+        [enc setBuffer:rowsbuf offset:ds4_gpu_tensor_offset(rows) atIndex:5];
+        [enc setThreadgroupMemoryLength:(128u + 8u) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows_count, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer row score")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_indexer_map_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *rows,
+                                    const ds4_gpu_tensor *selected, uint32_t count) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !rows || !selected || count == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> rowsbuf = ds4_gpu_tensor_buffer(rows);
+        id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer(selected);
+        const uint64_t out_bytes = (uint64_t)count * sizeof(uint32_t);
+        const uint64_t rows_bytes = (uint64_t)count * sizeof(uint32_t);
+        const uint64_t sel_bytes = (uint64_t)count * sizeof(uint32_t);
+        if (!outbuf || !rowsbuf || !selbuf ||
+            ds4_gpu_tensor_bytes(out) < out_bytes ||
+            ds4_gpu_tensor_bytes(rows) < rows_bytes ||
+            ds4_gpu_tensor_bytes(selected) < sel_bytes) {
+            fprintf(stderr, "ds4: Metal indexer row map received undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_indexer_map_rows");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:0];
+        [enc setBuffer:rowsbuf offset:ds4_gpu_tensor_offset(rows) atIndex:1];
+        [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBytes:&count length:sizeof(count) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)count + 63u) / 64u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer row map")) return 0;
+    }
     return 1;
 }
 

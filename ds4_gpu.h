@@ -628,6 +628,26 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+/* Candidate-restricted variant: one output slot per entry of `rows`, where
+ * rows[i] selects the key-cache row to score. Same math as score_one. */
+int ds4_gpu_glm_indexer_score_rows_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        const ds4_gpu_tensor *rows,
+        uint32_t                visible_rows,
+        uint32_t                rows_count,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale);
+
+int ds4_gpu_indexer_map_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *rows,
+        const ds4_gpu_tensor *selected,
+        uint32_t                count);
+
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

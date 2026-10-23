@@ -1978,7 +1978,7 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 
     threadgroup float *ktg = shared;
-    threadgroup float *psum = ktg + 128u;
+    threadgroup float *psum = ktg + 128u;   /* two 4-float phases */
 
     if (tid < 128u) {
         ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
@@ -1997,22 +1997,100 @@ kernel void kernel_glm_indexer_score_one_direct(
 
         float s = dot(q4[lane], k4[lane]);
         s = simd_sum(s);
+        /* Alternate the partial buffer so the next iteration cannot overwrite
+         * the slots thread 0 is still reading. This removes the second
+         * barrier while keeping the accumulation order identical. */
+        threadgroup float *ps = psum + (head0 & 4u);
         if (lane == 0) {
-            psum[sg] = max(s * args.scale, 0.0f) * weights[head];
+            ps[sg] = max(s * args.scale, 0.0f) * weights[head];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
-            acc += psum[0];
-            acc += psum[1];
-            acc += psum[2];
-            acc += psum[3];
+            acc += ps[0];
+            acc += ps[1];
+            acc += ps[2];
+            acc += ps[3];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (tid == 0) {
         scores[row] = acc;
     }
+}
+
+/* Same math as kernel_glm_indexer_score_one_direct, but the row for each
+ * output slot comes from a compact candidate list. Used by V4.1 layers whose
+ * indexer candidate set is restricted by an earlier block selection. */
+kernel void kernel_glm_indexer_score_rows(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const uint *rows,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint i [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    const uint row = rows[i];
+    if (row >= args.n_rows) {
+        if (tid == 0) scores[i] = -INFINITY;
+        return;
+    }
+
+    threadgroup float *ktg = shared;
+    threadgroup float *psum = ktg + 128u;   /* two 4-float phases */
+
+    if (tid < 128u) {
+        ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                                             (uint64_t)row * 128u + tid,
+                                             args.cache_f16);
+    }
+
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head0 = 0; head0 < 32u; head0 += 4u) {
+        const uint head = head0 + (uint)sg;
+        device const float4 *q4 = (device const float4 *)(q +
+            (uint64_t)head * 128u * sizeof(float));
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+
+        float s = dot(q4[lane], k4[lane]);
+        s = simd_sum(s);
+        /* Alternate the partial buffer so the next iteration cannot overwrite
+         * the slots thread 0 is still reading. This removes the second
+         * barrier while keeping the accumulation order identical. */
+        threadgroup float *ps = psum + (head0 & 4u);
+        if (lane == 0) {
+            ps[sg] = max(s * args.scale, 0.0f) * weights[head];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            acc += ps[0];
+            acc += ps[1];
+            acc += ps[2];
+            acc += ps[3];
+        }
+    }
+
+    if (tid == 0) {
+        scores[i] = acc;
+    }
+}
+
+/* Map compact top-k positions back to the original row ids. */
+kernel void kernel_indexer_map_rows(
+        device uint *out,
+        device const uint *rows,
+        device const uint *selected,
+        constant uint &count,
+        uint k [[thread_position_in_grid]]) {
+    if (k >= count) return;
+    out[k] = rows[selected[k]];
 }
 
 kernel void kernel_glm_indexer_scores_batch(
