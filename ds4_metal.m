@@ -36027,7 +36027,14 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         };
 
         if (n_head == 32u && head_dim == 128u) {
-            id<MTLComputePipelineState> direct_pipeline =
+            /* Four rows per SIMD group, sixteen per threadgroup: the same dot,
+             * simd_sum and per-head accumulation as the scalar kernel, without
+             * its per-head threadgroup barriers and with the query row read
+             * once per head instead of once per row. The scalar kernel behind
+             * the disable switch is the A/B reference. */
+            const int rows4 = getenv("DS4_METAL_DISABLE_V41_SCORE_ROWS4") == NULL;
+            id<MTLComputePipelineState> direct_pipeline = rows4 ?
+                ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_rows4") :
                 ds4_gpu_hot_pipeline(g_glm_indexer_score_one_direct_pipeline,
                                      "kernel_glm_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
@@ -36043,9 +36050,14 @@ int ds4_gpu_glm_indexer_score_one_tensor(
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
             [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 8u) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            if (!rows4) {
+                [enc setThreadgroupMemoryLength:(128u + 8u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 15u) / 16u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer direct score")) return 0;
