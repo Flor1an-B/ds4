@@ -277,6 +277,16 @@ tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4
 tests/test_deepseek41_graph: tests/test_deepseek41_graph.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_streaming_vision_policy.o: tests/test_streaming_vision_policy.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_streaming_vision_policy: tests/test_streaming_vision_policy.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-streaming-vision-policy
+test-streaming-vision-policy: tests/test_streaming_vision_policy
+	./tests/test_streaming_vision_policy
+
 tests/test_deepseek41_dspark.o: tests/test_deepseek41_dspark.c ds4.c ds4_deepseek41_dspark.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1484,6 +1494,7 @@ clean:
 	rm -f tests/test_qwen4_prompt_checkpoint tests/test_qwen4_prompt_checkpoint.o
 	rm -f tests/test_kvstore_near_tail
 	rm -f tests/test_qwen_tool_disk_key
+	rm -f tests/test_streaming_vision_policy
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
