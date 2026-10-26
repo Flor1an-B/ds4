@@ -187,6 +187,15 @@ static void buf_puts_special(buf *b, const char *s) {
     if (b->trusted) memset(b->trusted + start, 1, b->len - start);
 }
 
+/* Append another buffer's bytes together with its trusted mask.  A NULL mask
+ * leaves the appended bytes untrusted, matching buf_append. */
+static void buf_append_masked(buf *b, const char *p, size_t n,
+                              const unsigned char *mask) {
+    const size_t start = b->len;
+    buf_append(b, p, n);
+    if (b->trusted && mask) memcpy(b->trusted + start, mask, n);
+}
+
 static void buf_printf(buf *b, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -3012,20 +3021,16 @@ static void append_json_object_or_empty(buf *b, const char *json) {
     json_args_free(&args);
 }
 
-/* Replay the sampled DSML block byte for byte, but trust only the delimiter
+/* Replay sampled tool text byte for byte, but trust only the delimiter
  * spellings the parser itself used. Argument values stay ordinary text, so a
  * user string echoed by the model cannot become chat syntax. */
-static void append_dsml_raw_v41(buf *b, const char *raw) {
-    static const char *const tags[] = {
-        DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END,
-        DS41_INVOKE_START, DS41_INVOKE_END,
-        DS41_PARAM_START, DS41_PARAM_END,
-    };
+static void append_raw_tool_text_tags(buf *b, const char *raw,
+                                      const char *const *tags, size_t ntags) {
     const char *p = raw, *span = raw;
     while (*p) {
         const char *hit = NULL;
         size_t hitlen = 0;
-        for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+        for (size_t i = 0; i < ntags; i++) {
             const size_t n = strlen(tags[i]);
             if (!strncmp(p, tags[i], n)) {
                 hit = tags[i];
@@ -3043,6 +3048,15 @@ static void append_dsml_raw_v41(buf *b, const char *raw) {
         p++;
     }
     if (*span) buf_puts(b, span);
+}
+
+static void append_dsml_raw_v41(buf *b, const char *raw) {
+    static const char *const tags[] = {
+        DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END,
+        DS41_INVOKE_START, DS41_INVOKE_END,
+        DS41_PARAM_START, DS41_PARAM_END,
+    };
+    append_raw_tool_text_tags(b, raw, tags, sizeof(tags) / sizeof(tags[0]));
 }
 
 static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41) {
