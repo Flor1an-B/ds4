@@ -49731,7 +49731,9 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
     qwen4_bind b[4];
+    /* the kernel ropes into float tmp[64] with rope_freq[32] */
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        n_rot > 64 || (n_rot % 2) != 0 ||
         !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
                            "indexer k_norm") ||
@@ -50041,7 +50043,7 @@ int ds4_gpu_qwen4_idx_block_key_rows_tensor(
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||
-        (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        (idx_dim % 32) != 0 || n_rot > idx_dim || n_rot > 64 || (n_rot % 2) != 0 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float), "indexer k_norm") ||
         !qwen4_bind_rows(&b[1], table, entry0, n_rows)) {
         return 0;
