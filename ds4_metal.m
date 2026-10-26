@@ -17319,6 +17319,11 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         gate_bufs[load_i] = nil;
         up_bufs[load_i] = nil;
         down_bufs[load_i] = nil;
+        /* A GPU-copy entry's bytes land only when g_batch_cb runs the blit;
+         * until then pruning must not recycle its slot for a CPU pread. */
+        if (gpu_copy_source && !ds4_gpu_stream_expert_cache_mark_inflight(entry)) {
+            return 0;
+        }
         entries[slot] = entry;
     }
 
