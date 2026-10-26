@@ -2790,7 +2790,7 @@ static bool append_glm_tool_schema_json(buf *b, const char *json,
 
 static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
-    buf_puts(b,
+    buf_puts_special(b,
         "\n# Tools\n\n"
         "You may call one or more functions to assist with the user query.\n\n"
         "You are provided with function signatures within <tools></tools> XML tags:\n"
@@ -2816,7 +2816,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
     }
     if (!any) buf_putc(b, '\n');
 
-    buf_puts(b,
+    buf_puts_special(b,
         "</tools>\n\n"
         "For each function call, output the function name and arguments within the following XML format:\n"
         "<tool_call>{function-name}"
@@ -2883,9 +2883,9 @@ static bool chat_msg_is_glm_tool_result(const chat_msg *m) {
 
 static void append_glm_tool_response(buf *b, const char *text, size_t len) {
     char *body = xstrndup(text ? text : "", len);
-    buf_puts(b, "<tool_response>");
+    buf_puts_special(b, "<tool_response>");
     append_glm_tool_response_text(b, body);
-    buf_puts(b, "</tool_response>");
+    buf_puts_special(b, "</tool_response>");
     free(body);
 }
 
@@ -2952,11 +2952,11 @@ static void append_dsml_arg(buf *b, const json_arg *arg, bool v41) {
 }
 
 static void append_glm_arg(buf *b, const json_arg *arg) {
-    buf_puts(b, "<arg_key>");
+    buf_puts_special(b, "<arg_key>");
     append_glm_arg_key_text(b, arg->key);
-    buf_puts(b, "</arg_key><arg_value>");
+    buf_puts_special(b, "</arg_key><arg_value>");
     append_glm_arg_value_text(b, arg->value);
-    buf_puts(b, "</arg_value>");
+    buf_puts_special(b, "</arg_value>");
 }
 
 static bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order, bool v41) {
@@ -3087,7 +3087,13 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
                                        const tool_schema_orders *tool_orders) {
     if (!calls || calls->len == 0) return;
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        buf_puts(b, calls->raw_tool_text);
+        static const char *const tags[] = {
+            "<tool_call>", "</tool_call>",
+            "<arg_key>", "</arg_key>",
+            "<arg_value>", "</arg_value>",
+        };
+        append_raw_tool_text_tags(b, calls->raw_tool_text, tags,
+                                  sizeof(tags) / sizeof(tags[0]));
         return;
     }
     /* GLM's chat template emits the block inline, with no newline before or
@@ -3097,14 +3103,14 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order =
             tool_schema_orders_find(tool_orders, tc->name);
-        buf_puts(b, "<tool_call>");
+        buf_puts_special(b, "<tool_call>");
         buf_puts(b, tc->name ? tc->name : "");
         if (!append_glm_arguments_from_json(b, tc->arguments, order)) {
-            buf_puts(b, "<arg_key>arguments</arg_key><arg_value>");
+            buf_puts_special(b, "<arg_key>arguments</arg_key><arg_value>");
             append_glm_arg_value_text(b, tc->arguments);
-            buf_puts(b, "</arg_value>");
+            buf_puts_special(b, "</arg_value>");
         }
-        buf_puts(b, "</tool_call>");
+        buf_puts_special(b, "</tool_call>");
     }
 }
 
@@ -3294,18 +3300,18 @@ static void append_glm_assistant_message_prefix(buf *out,
     const char *content = m && m->content ? m->content : "";
     if (text_starts_with_think_tag(content)) return;
     if (preserve_reasoning) {
-        buf_puts(out, "<think>");
+        buf_puts_special(out, "<think>");
         buf_puts(out, m && m->reasoning ? m->reasoning : "");
-        buf_puts(out, "</think>");
+        buf_puts_special(out, "</think>");
     } else {
-        buf_puts(out, "<think></think>");
+        buf_puts_special(out, "<think></think>");
     }
 }
 
-static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
-                                         const char *tool_schemas,
-                                         const tool_schema_orders *tool_orders,
-                                         ds4_think_mode think_mode) {
+static char *render_glm_chat_prompt_text_impl(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted_out) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
@@ -3315,25 +3321,27 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     }
 
     buf out = {0};
-    buf_puts(&out, "[gMASK]<sop>");
+    if (trusted_out) buf_track_trusted(&out);
+    buf_puts_special(&out, "[gMASK]<sop>");
     if (think) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
-        buf_puts(&out, "<|system|>");
+        buf_puts_special(&out, "<|system|>");
         buf_puts(&out, effort ? effort : "Reasoning Effort: Max");
     }
     if (tool_schemas && tool_schemas[0]) {
         buf tools = {0};
+        if (trusted_out) buf_track_trusted(&tools);
         append_glm_tools_prompt_text(&tools, tool_schemas);
         if (tools.len) {
-            buf_puts(&out, "<|system|>");
-            buf_puts(&out, tools.ptr);
+            buf_puts_special(&out, "<|system|>");
+            buf_append_masked(&out, tools.ptr, tools.len, tools.trusted);
         }
         buf_free(&tools);
     }
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
-        buf_puts(&out, "<|system|>");
+        buf_puts_special(&out, "<|system|>");
         buf_puts(&out, m->content ? m->content : "");
     }
 
@@ -3345,19 +3353,19 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
             observation_open = false;
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
-            if (!observation_open) buf_puts(&out, "<|observation|>");
+            if (!observation_open) buf_puts_special(&out, "<|observation|>");
             append_glm_tool_result_message(&out, m);
             observation_open = true;
             pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
             observation_open = false;
-            buf_puts(&out, "<|user|>");
+            buf_puts_special(&out, "<|user|>");
             buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
             observation_open = false;
             (void)pending_assistant;
-            buf_puts(&out, "<|assistant|>");
+            buf_puts_special(&out, "<|assistant|>");
             append_glm_assistant_message_prefix(
                 &out, m, think && (tool_context || i > last_user_idx));
             append_trimmed_text(&out, m->content);
@@ -3368,11 +3376,27 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     }
 
     if (pending_assistant) {
-        buf_puts(&out, "<|assistant|>");
-        buf_puts(&out, think ? "<think>" : "<think></think>");
+        buf_puts_special(&out, "<|assistant|>");
+        buf_puts_special(&out, think ? "<think>" : "<think></think>");
     }
 
-    return buf_take(&out);
+    return trusted_out ? buf_take_masked(&out, trusted_out) : buf_take(&out);
+}
+
+static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
+                                         const char *tool_schemas,
+                                         const tool_schema_orders *tool_orders,
+                                         ds4_think_mode think_mode) {
+    return render_glm_chat_prompt_text_impl(msgs, tool_schemas, tool_orders,
+                                            think_mode, NULL);
+}
+
+static char *render_glm_chat_prompt_text_masked(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted) {
+    return render_glm_chat_prompt_text_impl(msgs, tool_schemas, tool_orders,
+                                            think_mode, trusted);
 }
 
 typedef struct {
@@ -3938,11 +3962,13 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
-static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
-                                       const tool_schema_orders *tool_orders,
-                                       ds4_think_mode think_mode) {
+static char *render_glm_live_tool_tail_impl(
+        const chat_msgs *msgs, int start,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted_out) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
+    if (trusted_out) buf_track_trusted(&out);
     bool pending_assistant = false;
     bool observation_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
@@ -3951,18 +3977,18 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
             observation_open = false;
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
-            if (!observation_open) buf_puts(&out, "<|observation|>");
+            if (!observation_open) buf_puts_special(&out, "<|observation|>");
             append_glm_tool_result_message(&out, m);
             observation_open = true;
             pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
             observation_open = false;
-            buf_puts(&out, "<|user|>");
+            buf_puts_special(&out, "<|user|>");
             buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
             observation_open = false;
-            buf_puts(&out, "<|assistant|>");
+            buf_puts_special(&out, "<|assistant|>");
             append_glm_assistant_message_prefix(&out, m, think);
             append_trimmed_text(&out, m->content);
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
@@ -3972,10 +3998,25 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     }
 
     if (pending_assistant) {
-        buf_puts(&out, "<|assistant|>");
-        buf_puts(&out, think ? "<think>" : "<think></think>");
+        buf_puts_special(&out, "<|assistant|>");
+        buf_puts_special(&out, think ? "<think>" : "<think></think>");
     }
-    return buf_take(&out);
+    return trusted_out ? buf_take_masked(&out, trusted_out) : buf_take(&out);
+}
+
+static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
+                                       const tool_schema_orders *tool_orders,
+                                       ds4_think_mode think_mode) {
+    return render_glm_live_tool_tail_impl(msgs, start, tool_orders,
+                                          think_mode, NULL);
+}
+
+static char *render_glm_live_tool_tail_masked(
+        const chat_msgs *msgs, int start,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted) {
+    return render_glm_live_tool_tail_impl(msgs, start, tool_orders,
+                                          think_mode, trusted);
 }
 
 /* Continue a live session after the model's tool-call turn: its <|im_end|>
