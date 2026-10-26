@@ -69,6 +69,11 @@ typedef struct {
     char *ptr;
     size_t len;
     size_t cap;
+    /* Optional byte mask parallel to ptr: 1 marks a literal the chat
+     * renderer itself inserted, the only positions allowed to become
+     * control tokens. NULL means no masking. */
+    unsigned char *trusted;
+    size_t trusted_cap;
 } buf;
 
 static void die(const char *msg) {
@@ -136,11 +141,35 @@ static void buf_reserve(buf *b, size_t add) {
     b->cap = cap;
 }
 
+static void buf_reserve_trusted(buf *b, size_t need) {
+    if (need <= b->trusted_cap) return;
+    size_t cap = b->trusted_cap ? b->trusted_cap * 2 : 256;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
+    b->trusted = xrealloc(b->trusted, cap);
+    b->trusted_cap = cap;
+}
+
+/* Start recording which appended bytes are trusted chat syntax. */
+static void buf_track_trusted(buf *b) {
+    buf_reserve_trusted(b, b->len ? b->len : 1);
+    if (b->len) memset(b->trusted, 0, b->len);
+}
+
 static void buf_append(buf *b, const void *p, size_t n) {
     buf_reserve(b, n);
     memcpy(b->ptr + b->len, p, n);
     b->len += n;
     b->ptr[b->len] = '\0';
+    if (b->trusted) {
+        buf_reserve_trusted(b, b->len);
+        memset(b->trusted + b->len - n, 0, n);
+    }
 }
 
 static void buf_putc(buf *b, char c) {
@@ -149,6 +178,14 @@ static void buf_putc(buf *b, char c) {
 
 static void buf_puts(buf *b, const char *s) {
     buf_append(b, s, strlen(s));
+}
+
+/* Append a literal inserted by the renderer itself: the only kind of text
+ * that may be recognized as a control token. */
+static void buf_puts_special(buf *b, const char *s) {
+    const size_t start = b->len;
+    buf_puts(b, s);
+    if (b->trusted) memset(b->trusted + start, 1, b->len - start);
 }
 
 static void buf_printf(buf *b, const char *fmt, ...) {
@@ -165,15 +202,25 @@ static void buf_printf(buf *b, const char *fmt, ...) {
     b->len += (size_t)n;
 }
 
-static char *buf_take(buf *b) {
-    if (!b->ptr) return xstrdup("");
+static char *buf_take_masked(buf *b, unsigned char **trusted) {
+    if (trusted) *trusted = b->trusted;
+    else free(b->trusted);
+    if (!b->ptr) {
+        memset(b, 0, sizeof(*b));
+        return xstrdup("");
+    }
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
     return p;
 }
 
+static char *buf_take(buf *b) {
+    return buf_take_masked(b, NULL);
+}
+
 static void buf_free(buf *b) {
     free(b->ptr);
+    free(b->trusted);
     memset(b, 0, sizeof(*b));
 }
 
@@ -846,6 +893,8 @@ typedef struct {
     char *prompt_text;
     /* --trace only: control tokens found inside client-supplied text. */
     char *client_marker_note;
+    unsigned char *prompt_trusted;
+    bool prompt_ambiguous;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -903,9 +952,11 @@ typedef struct {
     bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
+    unsigned char *responses_live_suffix_trusted;
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    unsigned char *anthropic_live_suffix_trusted;
     /* Canonical identity of a tool conversation, rendered before
      * tool_memory_attach_to_messages() substitutes sampled bytes:
      *
@@ -1093,12 +1144,15 @@ static void request_free(request *r) {
     free(r->raw_body);
     free(r->prompt_text);
     free(r->client_marker_note);
+    free(r->prompt_trusted);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
+    free(r->responses_live_suffix_trusted);
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    free(r->anthropic_live_suffix_trusted);
     free(r->full_input_key);
     free(r->tool_parent_key);
     tool_schema_orders_free(&r->tool_orders);
@@ -2659,7 +2713,7 @@ bad:
 
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
-    if (v41) buf_puts(b,
+    if (v41) buf_puts_special(b,
         "## Tools\n\n"
         "You can invoke tools using this format:\n\n"
         DS41_TOOL_CALLS_START "\n"
@@ -2671,7 +2725,7 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41)
         "To write that escaped spelling literally, use &amp;lt;/｜DSML｜ parameter>. Other HTML entities are unchanged.\n\n"
         "Finish reasoning with </think> before tool calls or a final response.\n\n"
         "### Available Tool Schemas\n\n");
-    else buf_puts(b,
+    else buf_puts_special(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
         "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
@@ -2968,14 +3022,14 @@ static void append_dsml_json_literal(buf *b, const char *s, bool v41) {
 }
 
 static void append_dsml_arg(buf *b, const json_arg *arg, bool v41) {
-    buf_puts(b, v41 ? DS41_PARAM_START " name=\"" : "<｜DSML｜parameter name=\"");
+    buf_puts_special(b, v41 ? DS41_PARAM_START " name=\"" : "<｜DSML｜parameter name=\"");
     append_dsml_attr_escaped(b, arg->key);
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
     if (arg->is_string) append_dsml_parameter_text(b, arg->value, v41);
     else append_dsml_json_literal(b, arg->value, v41);
-    buf_puts(b, v41 ? DS41_PARAM_END "\n" : "</｜DSML｜parameter>\n");
+    buf_puts_special(b, v41 ? DS41_PARAM_END "\n" : "</｜DSML｜parameter>\n");
 }
 
 static void append_glm_arg(buf *b, const json_arg *arg) {
@@ -3048,27 +3102,61 @@ static void append_json_object_or_empty(buf *b, const char *json) {
     json_args_free(&args);
 }
 
+/* Replay the sampled DSML block byte for byte, but trust only the delimiter
+ * spellings the parser itself used. Argument values stay ordinary text, so a
+ * user string echoed by the model cannot become chat syntax. */
+static void append_dsml_raw_v41(buf *b, const char *raw) {
+    static const char *const tags[] = {
+        DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END,
+        DS41_INVOKE_START, DS41_INVOKE_END,
+        DS41_PARAM_START, DS41_PARAM_END,
+    };
+    const char *p = raw, *span = raw;
+    while (*p) {
+        const char *hit = NULL;
+        size_t hitlen = 0;
+        for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+            const size_t n = strlen(tags[i]);
+            if (!strncmp(p, tags[i], n)) {
+                hit = tags[i];
+                hitlen = n;
+                break;
+            }
+        }
+        if (hit) {
+            buf_append(b, span, (size_t)(p - span));
+            buf_puts_special(b, hit);
+            p += hitlen;
+            span = p;
+            continue;
+        }
+        p++;
+    }
+    if (*span) buf_puts(b, span);
+}
+
 static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41) {
     if (!calls || calls->len == 0) return;
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        buf_puts(b, calls->raw_tool_text);
+        if (v41) append_dsml_raw_v41(b, calls->raw_tool_text);
+        else buf_puts(b, calls->raw_tool_text);
         return;
     }
-    buf_puts(b, v41 ? "\n\n" DS41_TOOL_CALLS_START "\n" : "\n\n<｜DSML｜tool_calls>\n");
+    buf_puts_special(b, v41 ? "\n\n" DS41_TOOL_CALLS_START "\n" : "\n\n<｜DSML｜tool_calls>\n");
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        buf_puts(b, v41 ? DS41_INVOKE_START " name=\"" : "<｜DSML｜invoke name=\"");
+        buf_puts_special(b, v41 ? DS41_INVOKE_START " name=\"" : "<｜DSML｜invoke name=\"");
         append_dsml_attr_escaped(b, tc->name);
         buf_puts(b, "\">\n");
         if (!append_dsml_arguments_from_json(b, tc->arguments, NULL, v41)) {
-            buf_puts(b, v41 ? DS41_PARAM_START " name=\"arguments\" string=\"true\">" :
+            buf_puts_special(b, v41 ? DS41_PARAM_START " name=\"arguments\" string=\"true\">" :
                             "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
             append_dsml_parameter_text(b, tc->arguments, v41);
-            buf_puts(b, v41 ? DS41_PARAM_END "\n" : "</｜DSML｜parameter>\n");
+            buf_puts_special(b, v41 ? DS41_PARAM_END "\n" : "</｜DSML｜parameter>\n");
         }
-        buf_puts(b, v41 ? DS41_INVOKE_END "\n" : "</｜DSML｜invoke>\n");
+        buf_puts_special(b, v41 ? DS41_INVOKE_END "\n" : "</｜DSML｜invoke>\n");
     }
-    buf_puts(b, v41 ? DS41_TOOL_CALLS_END : "</｜DSML｜tool_calls>");
+    buf_puts_special(b, v41 ? DS41_TOOL_CALLS_END : "</｜DSML｜tool_calls>");
 }
 
 static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
@@ -3507,8 +3595,10 @@ static const chat_msg **ds41_order_messages(const chat_msgs *msgs, const stop_li
 static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
                                            const char *tool_schemas,
                                            ds4_think_mode mode, bool live_tail,
-                                           const stop_list *initial_order) {
+                                           const stop_list *initial_order,
+                                           unsigned char **trusted_out) {
     buf out = {0};
+    buf_track_trusted(&out);
     chat_msgs fragments = {0};
     chat_msgs views = ds41_message_views(msgs, &fragments, &start);
     msgs = &views;
@@ -3522,10 +3612,12 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role) || (i > 0 && role_is_system(m->role))) last_user = i;
     }
+    /* The previous turn's end token is already the last token of the live
+     * KV (see 3102efe), so the live tail never re-emits it here. */
     if (!live_tail) {
-        buf_puts(&out, "<｜begin▁of▁sentence｜>");
+        buf_puts_special(&out, "<｜begin▁of▁sentence｜>");
         if (effort || (tool_schemas && tool_schemas[0])) {
-            buf_puts(&out, "<｜System｜>");
+            buf_puts_special(&out, "<｜System｜>");
             initial_system = true;
             if (effort) buf_puts(&out, effort);
             if (tool_schemas && tool_schemas[0])
@@ -3537,47 +3629,56 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
         if (role_is_system(m->role)) {
             if (i == 0 && initial_system) {
                 if (tool_schemas && tool_schemas[0]) buf_puts(&out, "\n\n");
-            } else buf_puts(&out, "<｜System｜>");
+            } else buf_puts_special(&out, "<｜System｜>");
             buf_puts(&out, m->content ? m->content : "");
             pending = i > 0 || live_tail;
             user_open = false;
         } else if (role_is_user_like(m->role)) {
-            buf_puts(&out, user_open ? "\n\n" : "<｜User｜>");
+            if (user_open) buf_puts(&out, "\n\n"); else buf_puts_special(&out, "<｜User｜>");
             if (strcmp(m->role, "user")) {
-                buf_puts(&out, "<tool_result>");
+                buf_puts_special(&out, "<tool_result>");
                 append_tool_result_text(&out, m->content);
-                buf_puts(&out, "</tool_result>");
+                buf_puts_special(&out, "</tool_result>");
             } else buf_puts(&out, m->content ? m->content : "");
             pending = user_open = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending) {
-                buf_puts(&out, "<｜Assistant｜>");
+                buf_puts_special(&out, "<｜Assistant｜>");
                 if (think && (keep_reasoning || i > last_user)) {
-                    buf_puts(&out, "<think>");
+                    buf_puts_special(&out, "<think>");
                     buf_puts(&out, m->reasoning ? m->reasoning : "");
                 }
-                buf_puts(&out, "</think>");
+                buf_puts_special(&out, "</think>");
             }
             buf_puts(&out, m->content ? m->content : "");
             append_dsml_tool_calls_text(&out, &m->calls, true);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            buf_puts_special(&out, "<｜end▁of▁sentence｜>");
             pending = user_open = false;
         }
     }
     if (pending) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
+        buf_puts_special(&out, "<｜Assistant｜>");
+        buf_puts_special(&out, think ? "<think>" : "</think>");
     }
     free(ordered);
     free(views.v);
     chat_msgs_free(&fragments);
-    return buf_take(&out);
+    return buf_take_masked(&out, trusted_out);
 }
 
 static char *render_deepseek41_chat(const chat_msgs *msgs, int start,
                                    const char *tool_schemas,
                                    ds4_think_mode mode, bool live_tail) {
-    return render_deepseek41_chat_ordered(msgs, start, tool_schemas, mode, live_tail, NULL);
+    return render_deepseek41_chat_ordered(msgs, start, tool_schemas, mode, live_tail,
+                                          NULL, NULL);
+}
+
+static char *render_deepseek41_chat_masked(const chat_msgs *msgs, int start,
+                                           const char *tool_schemas,
+                                           ds4_think_mode mode, bool live_tail,
+                                           unsigned char **trusted) {
+    return render_deepseek41_chat_ordered(msgs, start, tool_schemas, mode, live_tail,
+                                          NULL, trusted);
 }
 
 static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
@@ -3838,6 +3939,24 @@ static char *render_chat_prompt_text_preserving(server_model_syntax syntax,
                                             tool_orders, think_mode);
 }
 
+/* Same as render_chat_prompt_text_preserving, but also returns the trusted
+ * byte mask for the syntaxes that implement one. preserve_thinking only
+ * affects the Qwen branch, which never carries a mask. */
+static char *render_chat_prompt_text_preserving_masked(server_model_syntax syntax,
+                                                       const chat_msgs *msgs,
+                                                       const char *tool_schemas,
+                                                       const tool_schema_orders *tool_orders,
+                                                       ds4_think_mode think_mode,
+                                                       bool preserve_thinking,
+                                                       unsigned char **trusted) {
+    if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
+        return render_deepseek41_chat_masked(msgs, 0, tool_schemas, think_mode,
+                                             false, trusted);
+    if (trusted) *trusted = NULL;
+    return render_chat_prompt_text_preserving(syntax, msgs, tool_schemas,
+                                              tool_orders, think_mode, preserve_thinking);
+}
+
 /* The shipped template's retention default: every reasoning block is kept. */
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
@@ -3846,6 +3965,23 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 ds4_think_mode think_mode) {
     return render_chat_prompt_text_preserving(syntax, msgs, tool_schemas,
                                               tool_orders, think_mode, true);
+}
+
+/* Same as render_chat_prompt_text_for_syntax, but also returns the trusted
+ * byte mask for the syntaxes that implement one. A NULL mask keeps the
+ * historical scan-everything tokenization. */
+static char *render_chat_prompt_text_for_syntax_masked(server_model_syntax syntax,
+                                                       const chat_msgs *msgs,
+                                                       const char *tool_schemas,
+                                                       const tool_schema_orders *tool_orders,
+                                                       ds4_think_mode think_mode,
+                                                       unsigned char **trusted) {
+    if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
+        return render_deepseek41_chat_masked(msgs, 0, tool_schemas, think_mode,
+                                             false, trusted);
+    if (trusted) *trusted = NULL;
+    return render_chat_prompt_text_for_syntax(syntax, msgs, tool_schemas,
+                                              tool_orders, think_mode);
 }
 
 static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
@@ -3931,10 +4067,16 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
                                                char *err, size_t errlen) {
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41 && !r->prompt_trusted) {
+        snprintf(err, errlen, "internal: chat prompt has no trusted marker mask");
+        return false;
+    }
+    r->prompt_ambiguous = ds4_text_has_untrusted_special(e, r->prompt_text,
+                                                         r->prompt_trusted);
     size_t count = 0;
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
-        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        ds4_tokenize_rendered_chat_masked(e, r->prompt_text, r->prompt_trusted, &r->prompt);
         return true;
     }
     const size_t keep = ds4_vision_keep_images();   /* 0 = reject, not reduce */
@@ -4008,7 +4150,9 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             break;
         }
         char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
-        ds4_tokenize_rendered_chat(e, prefix, &r->prompt);
+        const size_t prefix_off = (size_t)(cursor - r->prompt_text);
+        ds4_tokenize_rendered_chat_masked(e, prefix,
+            r->prompt_trusted ? r->prompt_trusted + prefix_off : NULL, &r->prompt);
         free(prefix);
         if (!ds4_prompt_append_vision(e, &r->prompt, &r->images[i],
                                       &embeddings[i], err, errlen)) {
@@ -4019,7 +4163,11 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         memcpy(r->image_markers[i], inputs[i]->marker, sizeof(r->image_markers[i]));
         cursor = marker + strlen(inputs[i]->marker);
     }
-    if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+    if (ok) {
+        const size_t tail_off = (size_t)(cursor - r->prompt_text);
+        ds4_tokenize_rendered_chat_masked(e, cursor,
+            r->prompt_trusted ? r->prompt_trusted + tail_off : NULL, &r->prompt);
+    }
 
 done:
     for (size_t i = 0; i < count; i++)
@@ -4215,14 +4363,18 @@ static bool live_kv_boundary_ready(server_model_syntax syntax, bool end_committe
 
 static char *render_request_live_tool_tail(server *s, const request *r,
                                            const chat_msgs *msgs, int start,
-                                           const stop_list *ids) {
-    if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK41)
+                                           const stop_list *ids,
+                                           unsigned char **trusted) {
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK41) {
+        if (trusted) *trusted = NULL;
         return render_live_tool_tail_for_syntax(r->model_syntax, msgs, start,
                                                  &r->tool_orders, r->think_mode);
+    }
     /* Output-only requests omit the assistant message which declares order.
      * Copy the remembered order under its mutex, never borrow mutable IDs. */
     stop_list order = live_tool_call_order(s, r->api, ids);
-    char *text = render_deepseek41_chat_ordered(msgs, start, NULL, r->think_mode, true, &order);
+    char *text = render_deepseek41_chat_ordered(msgs, start, NULL, r->think_mode, true,
+                                                &order, trusted);
     id_list_free(&order);
     return text;
 }
@@ -4454,8 +4606,10 @@ static void responses_prepare_live_continuation(server *s, request *r,
     if (r->responses_live_call_ids.len == 0) return;
 
     free(r->responses_live_suffix_text);
+    free(r->responses_live_suffix_trusted);
     r->responses_live_suffix_text =
-        render_request_live_tool_tail(s, r, msgs, tail_start, &r->responses_live_call_ids);
+        render_request_live_tool_tail(s, r, msgs, tail_start, &r->responses_live_call_ids,
+                                      &r->responses_live_suffix_trusted);
 }
 
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
@@ -4603,8 +4757,10 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
     if (r->anthropic_live_call_ids.len == 0) return;
 
     free(r->anthropic_live_suffix_text);
+    free(r->anthropic_live_suffix_trusted);
     r->anthropic_live_suffix_text =
-        render_request_live_tool_tail(s, r, msgs, tail_start, &r->anthropic_live_call_ids);
+        render_request_live_tool_tail(s, r, msgs, tail_start, &r->anthropic_live_call_ids,
+                                      &r->anthropic_live_suffix_trusted);
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
@@ -4615,12 +4771,15 @@ static bool server_tracing(server *s);
 
 /* --trace only: report model control tokens that arrive inside client text.
  *
- * No engine in the Qwen lineage escapes these, and ds4's rendered-chat
- * tokenizer promotes any marker spelling in the rendered text into a real
- * control token, so a client that replays a transcript can hand the model
- * structure it never sampled.  Rewriting those bytes would break parity with
- * every reference template and invalidate KV checkpoints, so the renderer
- * leaves them alone and the trace records what happened instead. */
+ * DeepSeek41 (antirez/ds4#1284) now masks these at tokenize time: the marker
+ * spelling stays in the trace below for visibility, but it is BPE-encoded as
+ * ordinary text, not promoted. GLM and Qwen still escape every engine in that
+ * lineage, and ds4's rendered-chat tokenizer promotes any marker spelling in
+ * the rendered text into a real control token there, so a client that
+ * replays a transcript can hand the model structure it never sampled.
+ * Rewriting those bytes would break parity with every reference template and
+ * invalidate KV checkpoints, so those renderers leave them alone and the
+ * trace records what happened instead. */
 static void note_client_control_tokens(request *r, const chat_msgs *msgs) {
     static const struct {
         const char *name;
@@ -4889,9 +5048,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_preserving(
+    r->prompt_text = render_chat_prompt_text_preserving_masked(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode, r->preserve_thinking);
+        &r->tool_orders, r->think_mode, r->preserve_thinking, &r->prompt_trusted);
     if (server_tracing(s)) note_client_control_tokens(r, &msgs);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
@@ -5113,9 +5272,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+    r->prompt_text = render_chat_prompt_text_for_syntax_masked(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, &r->prompt_trusted);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(system);
@@ -6145,9 +6304,9 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
+    r->prompt_text = render_chat_prompt_text_for_syntax_masked(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, &r->prompt_trusted);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         buf_free(&combined_tool_schemas);
@@ -6344,9 +6503,15 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     user_msg.content = prompt;
     prompt = NULL;
     chat_msgs_push(&msgs, user_msg);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    r->prompt_text = render_chat_prompt_text_for_syntax_masked(
+        r->model_syntax, &msgs, NULL, NULL, r->think_mode, &r->prompt_trusted);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41 && !r->prompt_trusted) {
+        snprintf(err, errlen, "internal: chat prompt has no trusted marker mask");
+        goto bad;
+    }
+    r->prompt_ambiguous = ds4_text_has_untrusted_special(e, r->prompt_text,
+                                                         r->prompt_trusted);
+    ds4_tokenize_rendered_chat_masked(e, r->prompt_text, r->prompt_trusted, &r->prompt);
     chat_msgs_free(&msgs);
     free(prompt);
     return true;
@@ -11091,6 +11256,10 @@ struct server_slot {
      * only its byte length is needed to keep both text cursors aligned. */
     size_t live_text_image_len[16];
     size_t live_text_image_count;
+    /* A prompt with an untrusted control-token spelling produced this
+     * session. Its rendered text cannot be compared byte-wise with a
+     * differently masked prompt, so the text tiers and disk cache stay off. */
+    bool session_ambiguous;
 
     job *assigned;
     job *running;
@@ -12314,10 +12483,11 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
+        const unsigned char *suffix_trusted,
         ds4_tokens *out)
 {
-    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-        engine, exact_prefix, suffix_text, out);
+    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
+        engine, exact_prefix, suffix_text, suffix_trusted, out);
 }
 
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
@@ -12410,6 +12580,9 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const char *cache_text_key,
                                             const char *protect_text) {
     if (!s || !slot) return false;
+    /* An ambiguous session cannot be keyed by its rendered bytes: the same
+     * bytes tokenize differently when a spelling is syntax or content. */
+    if (slot->session_ambiguous) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -12698,6 +12871,12 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out,
                              size_t *loaded_text_bytes_out) {
+    if (s && slot && req) {
+        const bool ambiguous = ds4_text_has_untrusted_special(s->engine,
+            req->prompt_text, req->prompt_trusted);
+        if (ambiguous) slot->session_ambiguous = true;
+        if (ambiguous) return 0;
+    }
     int loaded = kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                         effective_prompt,
                                         loaded_path_out,
@@ -12746,9 +12925,12 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
  * which may retain reasoning omitted from a client's visible replay. */
 static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
+                                      const unsigned char *suffix_trusted,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || !suffix || req->image_count > 16) return false;
+    if (ds4_text_has_untrusted_special(s->engine, suffix, suffix_trusted))
+        slot->session_ambiguous = true;
     ds4_vision_span spans[16];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
@@ -12772,14 +12954,20 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
             return false;
         }
         char *text = xstrndup(cursor, (size_t)(marker - cursor));
-        ds4_tokenize_rendered_chat(s->engine, text, &prompt);
+        const size_t text_off = (size_t)(cursor - suffix);
+        ds4_tokenize_rendered_chat_masked(s->engine, text,
+            suffix_trusted ? suffix_trusted + text_off : NULL, &prompt);
         free(text);
         spans[i].token_start = (uint32_t)(prompt.len + wrapper);
         for (int64_t p = start; p < (int64_t)end; p++)
             ds4_tokens_push(&prompt, req->prompt.v[p]);
         cursor = marker + strlen(req->image_markers[i]);
     }
-    ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);
+    {
+        const size_t tail_off = (size_t)(cursor - suffix);
+        ds4_tokenize_rendered_chat_masked(s->engine, cursor,
+            suffix_trusted ? suffix_trusted + tail_off : NULL, &prompt);
+    }
     if (!ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
         ds4_tokens_free(&prompt);
         return false;
@@ -12904,6 +13092,14 @@ typedef struct {
     int matched_ids;    /* tool-output tiers: number of bound call ids */
 } slot_reuse;
 
+/* Byte-prefix reuse is only sound when both the incoming prompt and the
+ * session behind the slot contain no untrusted control-token spelling. If
+ * either does, the rendered bytes and the token sequence are no longer in
+ * one-to-one correspondence, so fall back to the token tiers. */
+static bool slot_text_reuse_allowed(const request *req, const server_slot *slot) {
+    return req && !req->prompt_ambiguous && slot && !slot->session_ambiguous;
+}
+
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                           const request *req) {
     slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
@@ -12928,6 +13124,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     const char *ptext = req->prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
+    const bool text_reuse_ok = slot_text_reuse_allowed(req, slot);
 
     /* Visible tiers use upstream 81a7658 normalization: image markers carry
      * request-local nonces, so the remembered visible transcript is stored
@@ -12935,7 +13132,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * Compare in that normalized space and require image-offset prefix
      * match; raw memcmp would miss whenever nonces differ.  Normalization
      * preserves byte offsets, so suffix_off applies to the raw prompt_text. */
-    if (req->api == API_RESPONSES && ptext) {
+    if (text_reuse_ok && req->api == API_RESPONSES && ptext) {
         visible_image_key vimages;
         char *vkey = visible_prompt_key(req, ptext, &vimages);
         if (vkey) {
@@ -13013,7 +13210,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
-    if (req->kind == REQ_CHAT && req->api != API_RESPONSES && ptext) {
+    if (text_reuse_ok && req->kind == REQ_CHAT && req->api != API_RESPONSES && ptext) {
         visible_image_key vimages;
         char *vkey = visible_prompt_key(req, ptext, &vimages);
         if (vkey) {
@@ -13050,7 +13247,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * known rendered byte length) rather than compared byte-for-byte; the
      * literal text around and between them must still match exactly. With
      * no images this degenerates to the original plain byte_prefix_match. */
-    if (ptext && slot->live_text && slot->live_text_pos == live_pos) {
+    if (text_reuse_ok && ptext && slot->live_text && slot->live_text_pos == live_pos) {
         size_t pos_a = 0, pos_b = 0;
         bool seg_ok = true;
         for (size_t i = 0; seg_ok && i < slot->live_text_image_count; i++) {
@@ -14029,6 +14226,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    const char *suffix,
+                                                   const unsigned char *suffix_trusted,
                                                    int *tokens_appended,
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
@@ -14040,7 +14238,8 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     }
 
     ds4_tokens target = {0};
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix,
+                                                   suffix_trusted, &target);
     const int before = ds4_session_pos(slot->session);
     bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
@@ -14086,7 +14285,7 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
                                         int *tokens_appended,
                                         char *err, size_t errlen) {
     char *suffix = build_invalid_tool_call_error_suffix(r, thinking, detail);
-    bool ok = append_rendered_suffix_to_live_session(s, slot, suffix,
+    bool ok = append_rendered_suffix_to_live_session(s, slot, suffix, NULL,
                                                      tokens_appended,
                                                      err, errlen);
     free(suffix);
@@ -15137,7 +15336,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     switch (reuse.kind) {
     case REUSE_RESPONSES_VISIBLE:
         if (!build_live_prompt_suffix(s, slot, &j->req,
-            j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
+            j->req.prompt_text + reuse.suffix_off,
+            j->req.prompt_trusted ? j->req.prompt_trusted + reuse.suffix_off : NULL,
+            &effective_prompt)) {
             cached = 0;
             cache_source = "none";
             break;
@@ -15156,7 +15357,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     case REUSE_RESPONSES_TOOL_OUTPUT:
         if (!build_live_prompt_suffix(s, slot, &j->req,
-            j->req.responses_live_suffix_text, &effective_prompt)) {
+            j->req.responses_live_suffix_text, j->req.responses_live_suffix_trusted,
+            &effective_prompt)) {
             cached = 0;
             cache_source = "none";
             break;
@@ -15170,7 +15372,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     case REUSE_ANTHROPIC_TOOL_OUTPUT:
         if (!build_live_prompt_suffix(s, slot, &j->req,
-            j->req.anthropic_live_suffix_text, &effective_prompt)) {
+            j->req.anthropic_live_suffix_text, j->req.anthropic_live_suffix_trusted,
+            &effective_prompt)) {
             cached = 0;
             cache_source = "none";
             break;
@@ -15226,7 +15429,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     case REUSE_THINKING_VISIBLE:
         if (!build_live_prompt_suffix(s, slot, &j->req,
-            j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
+            j->req.prompt_text + reuse.suffix_off,
+            j->req.prompt_trusted ? j->req.prompt_trusted + reuse.suffix_off : NULL,
+            &effective_prompt)) {
             cached = 0;
             cache_source = "none";
             break;
@@ -15238,7 +15443,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     case REUSE_MEMORY_TEXT:
         if (!build_live_prompt_suffix(s, slot, &j->req,
-            j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
+            j->req.prompt_text + reuse.suffix_off,
+            j->req.prompt_trusted ? j->req.prompt_trusted + reuse.suffix_off : NULL,
+            &effective_prompt)) {
             cached = 0;
             cache_source = "none";
             break;
@@ -27698,6 +27905,26 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* The conservative reuse rule: a prompt whose content spells a control
+ * token must neither read nor write the disk cache, and its session must not
+ * serve byte-prefix live reuse. */
+static void test_special_token_reuse_guards(void) {
+    server s = {0};
+    server_slot slot = {0};
+    slot.session_ambiguous = true;
+    TEST_ASSERT(!kv_cache_store_live_prefix_text(&s, &slot, NULL, 0, "cold",
+                                                 NULL, 0, NULL, NULL));
+
+    request req;
+    request_init(&req, REQ_CHAT, 128);
+    TEST_ASSERT(!slot_text_reuse_allowed(&req, &slot));
+    slot.session_ambiguous = false;
+    TEST_ASSERT(slot_text_reuse_allowed(&req, &slot));
+    req.prompt_ambiguous = true;
+    TEST_ASSERT(!slot_text_reuse_allowed(&req, &slot));
+    request_free(&req);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -27905,6 +28132,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_protects_checkpoint_about_to_load();
     test_kv_cache_eviction_protects_after_earlier_victims();
     test_kv_cache_eviction_keeps_protected_checkpoint_when_full();
+    test_special_token_reuse_guards();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

@@ -45303,75 +45303,137 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
+#define DS4_SPECIAL_MARKERS_CAP 32
+
+typedef struct {
+    const char *text;
+    int token;
+    size_t len;
+} ds4_special_marker;
+
+/* Build the renderer's control-token marker table for one vocab, plus a
+ * `starts` fast-reject mask so ordinary text costs one table lookup per
+ * byte. Ids are resolved per call because the System marker depends on the
+ * family; shared by the tokenizer below and by the ambiguity check so the
+ * set of recognized spellings can't drift between the two. */
+static int build_special_markers(const ds4_vocab *vocab,
+                                 ds4_special_marker out[DS4_SPECIAL_MARKERS_CAP],
+                                 bool starts[256]) {
+    const ds4_special_marker specials[] = {
+        {"<｜begin▁of▁sentence｜>", vocab->bos_id, 0},
+        {"<｜end▁of▁sentence｜>",   vocab->eos_id, 0},
+        {"[gMASK]",                vocab->bos_id, 0},
+        {"<sop>",                  vocab->sop_id, 0},
+        {"<|system|>",             vocab->system_id, 0},
+        {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1, 0},
+        {"<｜User｜>",              vocab->user_id, 0},
+        {"<｜Assistant｜>",         vocab->assistant_id, 0},
+        {"<|user|>",               vocab->user_id, 0},
+        {"<|assistant|>",          vocab->assistant_id, 0},
+        {"<|observation|>",        vocab->observation_id, 0},
+        {"<think>",                vocab->think_start_id, 0},
+        {"</think>",               vocab->think_end_id, 0},
+        {"<tool_call>",            vocab->tool_call_start_id, 0},
+        {"</tool_call>",           vocab->tool_call_end_id, 0},
+        {"<tool_response>",        vocab->tool_response_start_id, 0},
+        {"</tool_response>",       vocab->tool_response_end_id, 0},
+        {"<arg_key>",              vocab->arg_key_start_id, 0},
+        {"</arg_key>",             vocab->arg_key_end_id, 0},
+        {"<arg_value>",            vocab->arg_value_start_id, 0},
+        {"</arg_value>",           vocab->arg_value_end_id, 0},
+        {"｜DSML｜",                vocab->dsml_id, 0},
+        {"<|im_start|>",           vocab->im_start_id, 0},
+        {"<|im_end|>",             vocab->im_end_id, 0},
+        {"<|endoftext|>",          vocab->endoftext_id, 0},
+    };
+    const int n = (int)(sizeof(specials) / sizeof(specials[0]));
+    memset(starts, 0, 256 * sizeof(bool));
+    for (int i = 0; i < n; i++) {
+        out[i] = specials[i];
+        out[i].len = strlen(out[i].text);
+        if (out[i].token >= 0) starts[(uint8_t)out[i].text[0]] = true;
+    }
+    return n;
+}
+
 /* Split rendered chat text at marker strings: markers become their control
- * ids and the text between them goes through plain BPE.  At each position
- * markers are tried in table order; only bytes that start an active marker
- * are tried at all, so ordinary text costs one table lookup per byte.  Ids
- * are resolved per call because the System marker depends on the family. */
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
+ * ids and the text between them goes through plain BPE. `trusted`, when
+ * non-NULL, is a byte mask over `text`: only literals that the chat renderer
+ * itself inserted may become control tokens. User, tool, and model text is
+ * encoded by BPE even if it spells a control token, so content cannot inject
+ * chat syntax. */
+static void tokenize_rendered_chat_vocab_masked(const ds4_vocab *vocab, const char *text,
+                                                const unsigned char *trusted,
+                                                token_vec *out) {
     if (!text) text = "";
 
-    struct {
-        const char *text;
-        int token;
-    } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"[gMASK]",                vocab->bos_id},
-        {"<sop>",                  vocab->sop_id},
-        {"<|system|>",             vocab->system_id},
-        {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<|user|>",               vocab->user_id},
-        {"<|assistant|>",          vocab->assistant_id},
-        {"<|observation|>",        vocab->observation_id},
-        {"<think>",                vocab->think_start_id},
-        {"</think>",               vocab->think_end_id},
-        {"<tool_call>",            vocab->tool_call_start_id},
-        {"</tool_call>",           vocab->tool_call_end_id},
-        {"<tool_response>",        vocab->tool_response_start_id},
-        {"</tool_response>",       vocab->tool_response_end_id},
-        {"<arg_key>",              vocab->arg_key_start_id},
-        {"</arg_key>",             vocab->arg_key_end_id},
-        {"<arg_value>",            vocab->arg_value_start_id},
-        {"</arg_value>",           vocab->arg_value_end_id},
-        {"｜DSML｜",                vocab->dsml_id},
-        {"<|im_start|>",           vocab->im_start_id},
-        {"<|im_end|>",             vocab->im_end_id},
-        {"<|endoftext|>",          vocab->endoftext_id},
-    };
-    const int n_specials = (int)(sizeof(specials) / sizeof(specials[0]));
-    size_t len[sizeof(specials) / sizeof(specials[0])];
-    bool starts[256] = {false};
-    for (int i = 0; i < n_specials; i++) {
-        len[i] = strlen(specials[i].text);
-        if (specials[i].token >= 0) starts[(uint8_t)specials[i].text[0]] = true;
-    }
+    ds4_special_marker specials[DS4_SPECIAL_MARKERS_CAP];
+    bool starts[256];
+    const int n_specials = build_special_markers(vocab, specials, starts);
 
     const char *span = text;
     const char *p = text;
+    size_t index = 0;
     while (*p) {
         if (starts[(uint8_t)*p]) {
             int i = 0;
             while (i < n_specials &&
-                   (specials[i].token < 0 || strncmp(p, specials[i].text, len[i]))) i++;
+                   (specials[i].token < 0 || strncmp(p, specials[i].text, specials[i].len))) i++;
             if (i < n_specials) {
-                bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
-                token_vec_push(out, specials[i].token);
-                p += len[i];
-                span = p;
-                continue;
+                bool trusted_span = true;
+                if (trusted)
+                    for (size_t k = 0; k < specials[i].len; k++)
+                        if (!trusted[index + k]) { trusted_span = false; break; }
+                if (trusted_span) {
+                    bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
+                    token_vec_push(out, specials[i].token);
+                    p += specials[i].len;
+                    index += specials[i].len;
+                    span = p;
+                    continue;
+                }
             }
         }
         p++;
+        index++;
     }
     bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
 }
 
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
+    tokenize_rendered_chat_vocab_masked(vocab, text, NULL, out);
+}
+
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
-    tokenize_rendered_chat_vocab(&e->vocab, text, out);
+    tokenize_rendered_chat_vocab_masked(&e->vocab, text, NULL, out);
+}
+
+void ds4_tokenize_rendered_chat_masked(ds4_engine *e, const char *text,
+                                       const unsigned char *trusted, ds4_tokens *out) {
+    tokenize_rendered_chat_vocab_masked(&e->vocab, text, trusted, out);
+}
+
+/* True when the text spells a control token at a position the renderer did not
+ * mark trusted: such a prompt cannot share KV cache entries with a prompt that
+ * tokenizes the same bytes as syntax. */
+bool ds4_text_has_untrusted_special(ds4_engine *e, const char *text,
+                                    const unsigned char *trusted) {
+    if (!e || !text || !trusted) return false;
+    ds4_special_marker specials[DS4_SPECIAL_MARKERS_CAP];
+    bool starts[256];
+    const int n_specials = build_special_markers(&e->vocab, specials, starts);
+    size_t index = 0;
+    for (const char *p = text; *p; p++, index++) {
+        if (!starts[(uint8_t)*p]) continue;
+        int i = 0;
+        while (i < n_specials &&
+               (specials[i].token < 0 || strncmp(p, specials[i].text, specials[i].len))) i++;
+        if (i >= n_specials) continue;
+        for (size_t k = 0; k < specials[i].len; k++)
+            if (!trusted[index + k]) return true;
+    }
+    return false;
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
