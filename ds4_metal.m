@@ -49745,6 +49745,17 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
                           MTLSizeMake(n_blocks, 1, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+/* staged queries and vector key loads, plus the tile maxima the prefiltered
+ * selector needs; measured on M5, other devices keep the scalar scorer.
+ * Callers must not hand the selector tile maxima when this is false: the
+ * other scorers leave them stale. */
+int ds4_gpu_qwen4_idx_score_emits_tile_max(uint32_t n_tokens, uint32_t n_idx_head, uint32_t idx_dim) {
+    if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) return 0;
+    if (n_idx_head * idx_dim > 512u || (idx_dim & 3u) != 0u) return 0;
+    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
+    return vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon();
+}
+
 int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
         uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
@@ -49762,12 +49773,7 @@ int ds4_gpu_qwen4_idx_score_tensor(
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
-    /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5, other devices keep the
-     * scalar scorer */
-    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+    const bool vec = tile_max && ds4_gpu_qwen4_idx_score_emits_tile_max(n_tokens, n_idx_head, idx_dim);
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
