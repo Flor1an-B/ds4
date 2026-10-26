@@ -42827,10 +42827,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #ifdef __APPLE__
     const bool queue_single = g->tp_world != 2 && !g->streaming && !g->imatrix &&
         getenv("DS4_METAL_DISABLE_V41_DECODE_PIPELINE") == NULL;
+    /* Same mechanism, opt-in for SSD streaming: expert-ID readback and
+     * cache-replacement synchronization still bound the queue, so only the
+     * per-layer drain is lifted. Off by default and excluded from quality
+     * mode (unfused kernels bind whole expert tensors per layer there). */
+    const bool queue_stream = g->tp_world != 2 && g->streaming && !g->quality &&
+        getenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE") != NULL;
 #else
     const bool queue_single = false;
+    const bool queue_stream = false;
 #endif
-    const bool queue_layers = (g->tp_world == 2 || queue_single) && !g->imatrix &&
+    const bool queue_layers = (g->tp_world == 2 || queue_single || queue_stream) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     /* Set only once every early-exit path above is behind us. SSD streaming
      * keeps full scoring: the compact path adds a CPU/GPU round trip that has
@@ -42852,7 +42859,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
-        /* TP gates already submit ordered, bounded command buffers. Drain
+        /* TP gates and streaming selected-ID readback bound queued work. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
