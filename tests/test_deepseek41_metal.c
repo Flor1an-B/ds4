@@ -711,11 +711,18 @@ static int check_indexer_batch(void) {
     enum { KEYS = 1025, ROWS = 33, HEADS = 32, DIM = 128 };
     ds4_gpu_tensor *qt = upload(NULL, (size_t)ROWS * HEADS * DIM * sizeof(float));
     ds4_gpu_tensor *kt = upload(NULL, (size_t)KEYS * DIM * sizeof(float));
+    /* The V4.1 indexer's key cache is bf16 on Metal (DS41_INDEX_CACHE_ELEM_BYTES
+     * in ds4.c) and every kernel under test here (_batch, _pack/_packed) reads
+     * it as such; keep that round-trip explicit here instead of handing them
+     * kt's raw float32 bytes. Padded to the next 64-row multiple: the packed
+     * path's own bounds check rounds source_rows up that way. */
+    ds4_gpu_tensor *kt_bf16 = upload(NULL,
+        (size_t)(((KEYS + 63u) & ~63u)) * DIM * sizeof(uint16_t));
     ds4_gpu_tensor *wt = upload(NULL, (size_t)ROWS * HEADS * sizeof(float));
     ds4_gpu_tensor *st = upload(NULL, (size_t)(ROWS * KEYS + 1) * sizeof(float));
     const uint64_t packed_bytes = ds4_gpu_dsv41_indexer_packed_bytes(KEYS, ROWS);
     ds4_gpu_tensor *pt = upload(NULL, (size_t)packed_bytes + 4);
-    CHECK(qt && kt && wt && st && pt);
+    CHECK(qt && kt && kt_bf16 && wt && st && pt);
 #ifndef __APPLE__
     ds4_gpu_tensor *reference = upload(NULL, (size_t)KEYS * sizeof(float));
     CHECK(reference);
@@ -733,9 +740,10 @@ static int check_indexer_batch(void) {
         CHECK(ds4_gpu_dsv41_quantize(qt, DIM, ROWS * HEADS, DS4_V41_FP4_E8M0));
         CHECK(ds4_gpu_dsv41_quantize(kt, DIM, KEYS, DS4_V41_FP4_E8M0));
         if (range == 2) { q[0] = 1.0001f; k[67u * DIM] = 1.0003f; }
+        CHECK(ds4_gpu_tensor_copy_f32_to_bf16(kt_bf16, 0, kt, 0, (uint64_t)KEYS * DIM));
         uint32_t *packed_guard = (uint32_t *)((char *)ds4_gpu_tensor_contents(pt) + packed_bytes);
         *packed_guard = 0xabcdef01;
-        if (packed_available) CHECK(ds4_gpu_dsv41_indexer_pack(pt, qt, kt, KEYS, ROWS));
+        if (packed_available) CHECK(ds4_gpu_dsv41_indexer_pack(pt, qt, kt_bf16, KEYS, ROWS));
         CHECK(*packed_guard == 0xabcdef01);
         const uint32_t counts[] = {1, 7, 8, 9, 31, 32, 33};
         for (uint32_t ratio = 1; ratio <= 2; ratio++) {
@@ -751,9 +759,9 @@ static int check_indexer_batch(void) {
                             (uint64_t)rows * HEADS * 4u);
                         CHECK(qv && wv);
                         s[(size_t)rows * KEYS] = 12345;
-                        CHECK(mode ? ds4_gpu_dsv41_indexer_scores_packed(st, qv, wv, kt, pt,
+                        CHECK(mode ? ds4_gpu_dsv41_indexer_scores_packed(st, qv, wv, kt_bf16, pt,
                             KEYS, rows, start, ratio, ROWS, offset) :
-                            ds4_gpu_dsv41_indexer_scores_batch(st, qv, wv, kt, KEYS, rows, start, ratio));
+                            ds4_gpu_dsv41_indexer_scores_batch(st, qv, wv, kt_bf16, KEYS, rows, start, ratio));
                         CHECK(ds4_gpu_synchronize());
                         ds4_gpu_tensor_free(qv); ds4_gpu_tensor_free(wv);
                         CHECK(s[(size_t)rows * KEYS] == 12345);
@@ -789,7 +797,7 @@ static int check_indexer_batch(void) {
                                     double dot = 0;
                                     for (uint32_t d = 0; d < DIM; d++)
                                         dot += (double)q[((size_t)(t + offset) * HEADS + h) * DIM + d] *
-                                               k[(size_t)j * DIM + d];
+                                               bf16(k[(size_t)j * DIM + d]);
                                     const double term = fmax(dot / 64.0, 0) * w[(t + offset) * HEADS + h];
                                     expected += term;
                                     magnitude += fabs(term);
@@ -827,7 +835,7 @@ static int check_indexer_batch(void) {
     ds4_gpu_tensor_free(reference);
 #endif
     ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(wt);
-    ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(qt);
+    ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(kt_bf16); ds4_gpu_tensor_free(qt);
     fprintf(stderr, "V4.1 causal batched index scores: double-precision oracle PASS\n");
     return 1;
 }

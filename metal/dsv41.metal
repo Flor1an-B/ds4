@@ -309,7 +309,7 @@ kernel void kernel_dsv41_indexer_scores_bf16(
 kernel void kernel_dsv41_indexer_scores_packed(
         constant uint4 &args, constant uint2 &range,
         device const float *q, device const float *weights,
-        device const float *keys, device float *scores,
+        device const char *keys, device float *scores,
         device const uint *flags, device const bfloat *packed_q,
         device const bfloat *packed_keys,
         threadgroup float *scratch [[threadgroup(0)]],
@@ -339,7 +339,9 @@ kernel void kernel_dsv41_indexer_scores_packed(
     } else {
         auto query = tensor((device float *)q + (ulong)token * HEADS * DIM,
                              dextents<int32_t, 2>(DIM, HEADS));
-        auto all_keys = tensor((device float *)keys, dextents<int32_t, 2>(DIM, int(width)));
+        /* keys is the real index cache, bf16 on Metal like packed_keys: there
+         * is no retained full-precision key to fall back to, unlike q. */
+        auto all_keys = tensor((device bfloat *)keys, dextents<int32_t, 2>(DIM, int(width)));
         auto key = all_keys.slice(0, int(row0));
         auto dots = mm.template get_destination_cooperative_tensor<decltype(query), decltype(key), float>();
         for (uint16_t i = 0; i < dots.get_capacity(); i++)
