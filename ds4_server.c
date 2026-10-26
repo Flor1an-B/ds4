@@ -4018,6 +4018,9 @@ static char *render_chat_prompt_text_preserving_masked(server_model_syntax synta
                                                        ds4_think_mode think_mode,
                                                        bool preserve_thinking,
                                                        unsigned char **trusted) {
+    if (syntax == SERVER_MODEL_SYNTAX_GLM)
+        return render_glm_chat_prompt_text_masked(msgs, tool_schemas,
+                                                  tool_orders, think_mode, trusted);
     if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
         return render_deepseek41_chat_masked(msgs, 0, tool_schemas, think_mode,
                                              false, trusted);
@@ -23303,6 +23306,37 @@ static void test_render_glm_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+/* Regression: render_chat_prompt_text_preserving_masked() is the renderer
+ * /v1/chat/completions actually calls (ds4_server.c's chat handler), and
+ * syntax_uses_trusted_mask() requires a non-NULL mask for GLM, DeepSeek41 and
+ * Qwen or the request is rejected with "chat prompt has no trusted marker
+ * mask". A prior change added the DeepSeek41/Qwen cases here but missed GLM,
+ * which silently fell through to the untracked, NULL-mask renderer --
+ * breaking every GLM chat/completions request, found live on :8091. */
+static void test_render_chat_prompt_text_preserving_masked_sets_trust_mask(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_GLM, SERVER_MODEL_SYNTAX_DEEPSEEK41,
+        SERVER_MODEL_SYNTAX_QWEN,
+    };
+    for (size_t i = 0; i < sizeof(syntaxes) / sizeof(syntaxes[0]); i++) {
+        unsigned char *trusted = NULL;
+        char *prompt = render_chat_prompt_text_preserving_masked(
+            syntaxes[i], &msgs, NULL, NULL, DS4_THINK_HIGH, true, &trusted);
+        TEST_ASSERT(prompt != NULL);
+        TEST_ASSERT(trusted != NULL);
+        TEST_ASSERT(syntax_uses_trusted_mask(syntaxes[i]) && trusted);
+        free(prompt);
+        free(trusted);
+    }
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -29402,6 +29436,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
+    test_render_chat_prompt_text_preserving_masked_sets_trust_mask();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_reasoning_parity();
     test_render_qwen_tool_schema_escapes();
