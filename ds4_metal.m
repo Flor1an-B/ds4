@@ -30801,7 +30801,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 || top_k > n_comp || (top_k & (top_k - 1u)) != 0 ||
-        ratio == 0 || n_head == 0 || head_dim != 512) {
+        ratio == 0 || n_head == 0 || (n_head % 8u) != 0 || head_dim != 512) {
+        /* The pipelines below run 8 heads per threadgroup.  Simdgroups past
+         * n_head return early and never reach the threadgroup barriers the
+         * rest of the group waits on, so a partial group is undefined. */
         return 0;
     }
 
