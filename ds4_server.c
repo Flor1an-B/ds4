@@ -199,6 +199,13 @@ static void buf_printf(buf *b, const char *fmt, ...) {
     vsnprintf(b->ptr + b->len, b->cap - b->len, fmt, ap2);
     va_end(ap2);
     b->len += (size_t)n;
+    if (b->trusted) {
+        /* Keep the tracked mask defined for every appended byte.  This is
+         * the same untrusted fill buf_append performs, without allocating a
+         * temporary for the hot SSE chunk path. */
+        buf_reserve_trusted(b, b->len);
+        memset(b->trusted + b->len - (size_t)n, 0, (size_t)n);
+    }
 }
 
 static char *buf_take_masked(buf *b, unsigned char **trusted) {
@@ -23132,6 +23139,28 @@ static void test_special_token_reuse_guards(void) {
     request_free(&req);
 }
 
+/* json_escape uses buf_printf for \uXXXX control-character escapes.  A
+ * tracked buffer must mark those bytes untrusted, even after a reallocation;
+ * pre-fill the mask with 0xff so a missing zero-fill cannot pass by luck. */
+static void test_buf_printf_mask(void) {
+    buf b = {0};
+    buf_track_trusted(&b);
+    buf_puts_special(&b, "<|im_start|>");
+    const size_t before = b.len;
+
+    buf_reserve_trusted(&b, b.len + 64u);
+    memset(b.trusted + b.len, 0xff, 64u);
+
+    char text[] = {'a', 0x01, 'b', 0};
+    json_escape(&b, text);
+    TEST_ASSERT(b.len > before);
+    TEST_ASSERT(b.trusted != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\\u0001") != NULL);
+    for (size_t i = 0; i < before; i++) TEST_ASSERT(b.trusted[i] == 1);
+    for (size_t i = before; i < b.len; i++) TEST_ASSERT(b.trusted[i] == 0);
+    buf_free(&b);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -23303,6 +23332,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     test_special_token_reuse_guards();
+    test_buf_printf_mask();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
