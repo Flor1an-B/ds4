@@ -73471,6 +73471,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
+            /* Tokenizer-only tests can use an inspect-only engine; no weights
+             * are read. */
+            vocab_load(&e->vocab, &e->model);
             *out = e;
             return 0;
         }
@@ -73509,6 +73512,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (opt->inspect_only) {
+            /* Tokenizer-only tests can use an inspect-only engine; no weights
+             * are read. */
+            vocab_load(&e->vocab, &e->model);
             *out = e;
             return 0;
         }

@@ -136,6 +136,20 @@ static ds4_engine *test_get_engine(bool quality) {
     return *slot;
 }
 
+/* Tokenizer-only engine: model_open + vocab_load, no weights.  The GLM/Qwen
+ * injection tests use this with DS4_TEST_MODEL, so a full model or a
+ * prefix-backed sparse GGUF reaches the same code. */
+static ds4_engine *test_open_engine_inspect(const char *path) {
+    ds4_engine *engine = NULL;
+    ds4_engine_options opt = {
+        .model_path = path,
+        .backend = DS4_BACKEND_CPU,
+        .inspect_only = true,
+    };
+    if (ds4_engine_open(&engine, &opt) != 0) return NULL;
+    return engine;
+}
+
 static void test_close_engines(void) {
     ds4_engine_close(test_engine_fast);
     ds4_engine_close(test_engine_quality);
