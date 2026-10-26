@@ -28283,7 +28283,9 @@ static bool ds4_gpu_fill_visual_mixed_batch_mask(
         uint32_t       pos0,
         uint32_t       window,
         uint32_t       ratio) {
-    if (!mask || !tokens || vocab_size == 0 || n_tokens == 0 || n_raw == 0) {
+    /* first_raw_pos below wraps if more raw keys than positions exist */
+    if (!mask || !tokens || vocab_size == 0 || n_tokens == 0 || n_raw == 0 ||
+        (uint64_t)n_raw > (uint64_t)pos0 + n_tokens) {
         return false;
     }
     const uint16_t neg_inf_half = 0xfc00u;
