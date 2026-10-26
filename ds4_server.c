@@ -13346,13 +13346,18 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * GLM-5.3 cannot truncate its KDA recurrence, so it is excluded from this
      * blind tier entirely -- its only live rewind is the snapshot floor,
      * asked of the core further down, after every tier that needs no
-     * recompute.  The older GLM-5.2 frontier rewind keeps this tier. */
+     * recompute.  The older GLM-5.2 frontier rewind keeps this tier. Qwen4's
+     * rewind (ds4_session_rewind() in ds4.c) never refuses a target -- a
+     * snapshot miss just resets the recurrent/speculative state and replays
+     * the kept tokens on the next eval -- so it carries no failure mode to
+     * exclude it for. */
     const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine) &&
         ds4_session_vision_prefix_matches(slot->session, NULL, 0);
     const bool glm_truncate_here = ds4_engine_is_glm_dsa(s->engine) &&
         !ds4_engine_is_glm53(s->engine);
+    const bool qwen4_rewind = ds4_engine_is_qwen4(s->engine);
     const int rewind_to = live_prefix_rewind_target(
-        ds41_rewind || glm_truncate_here, ds41_rewind ? 2 : 1,
+        ds41_rewind || glm_truncate_here || qwen4_rewind, ds41_rewind ? 2 : 1,
         live_pos, req->prompt.len, common == req->prompt.len ? common : 0);
     if (rewind_to >= 0 && token_image_prefix) {
         pr.kind = REUSE_MEMORY_REWIND;
@@ -13443,6 +13448,23 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     }
 
     if (ds41_rewind && token_image_prefix && common < live_pos &&
+        common < req->prompt.len) {
+        const int diverged_to = live_prefix_rewind_target(true, 2, live_pos,
+                                                          req->prompt.len, common);
+        if (diverged_to >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = diverged_to;
+            return pr;
+        }
+    }
+
+    /* Same fork-divergence rewind as V4.1 above, for Qwen4 (e.g. a tool-call
+     * loop that compacted or edited earlier history below the live frontier).
+     * align=2 only gates live_prefix_rewind_target() into its fork branch;
+     * Qwen4 has no even-position constraint of its own, so the occasional
+     * target rounded down by one token is a negligible cost, not a
+     * correctness concern. */
+    if (qwen4_rewind && token_image_prefix && common < live_pos &&
         common < req->prompt.len) {
         const int diverged_to = live_prefix_rewind_target(true, 2, live_pos,
                                                           req->prompt.len, common);
@@ -18606,6 +18628,41 @@ static void test_slot_probe_v41_rewind_tiers(void) {
         request_free(&j.req);
     }
     ds4_test_use_deepseek41_shape(0);
+}
+
+/* Qwen4's rewind never refuses a target (ds4_session_rewind() in ds4.c: a
+ * snapshot miss just resets state and replays on the next eval), so unlike
+ * V4.1 it needs no even-position alignment for the strict-truncation case --
+ * the blind tier passes align=1 for it, so case 1 keeps the full prompt_len-1
+ * instead of V4.1's paired-down target. The fork-divergence tier still
+ * hardcodes align=2 for both engines (live_prefix_rewind_target() requires
+ * align>=2 to enter that branch at all), so cases 2-3 match V4.1 exactly. */
+static void test_slot_probe_qwen4_rewind_tiers(void) {
+    ds4_test_use_qwen4_shape(1);
+    TEST_ASSERT(ds4_engine_is_qwen4(NULL));
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+    struct { int shared; int extra; slot_reuse_kind kind; int reuse; } cases[] = {
+        {8, 0, REUSE_MEMORY_REWIND, 7},   /* strict truncation: 8-1, unpaired */
+        {6, 6, REUSE_MEMORY_REWIND, 6},   /* diverged after 6 */
+        {7, 6, REUSE_MEMORY_REWIND, 6},   /* diverged after 7: paired down */
+        {10, 1, REUSE_MEMORY_TOKEN, 10},  /* exact extension */
+        {1, 6, REUSE_NONE, 0},            /* nothing worth a pair */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        for (int i = 0; i < cases[c].shared; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < cases[c].extra; i++) ds4_tokens_push(&j.req.prompt, 900 + i);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == cases[c].kind);
+        TEST_ASSERT(pr.reuse_tokens == cases[c].reuse);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    ds4_test_use_qwen4_shape(0);
 }
 
 /* Parent-guarded tool-ID tier fixtures.
@@ -28207,6 +28264,7 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_probe_glm_rewind_tiers();
     test_slot_probe_live_state_tiers();
     test_slot_probe_v41_rewind_tiers();
+    test_slot_probe_qwen4_rewind_tiers();
     test_slot_probe_tool_parent_guard();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();

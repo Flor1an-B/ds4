@@ -514,6 +514,10 @@ void ds4_test_use_deepseek41_shape(int on);
 /* Test hook: server logic runs as if a GLM-5.3 model were loaded (on=1) until
  * restored (on=0), so the GLM rewind tiers are probeable without one. */
 void ds4_test_use_glm53_shape(int on);
+/* Test hook: server logic runs as if a Qwen3.8 Flash Next model were loaded
+ * (on=1) until restored (on=0), so the Qwen4 rewind tiers are probeable
+ * without one. */
+void ds4_test_use_qwen4_shape(int on);
 /* Test hook: stand in for the snapshot floor a graph-less checkpoint has no
  * ring to report.  pos <= 0 clears it. */
 void ds4_session_set_test_rewind_floor(ds4_session *s, int pos);

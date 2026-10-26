@@ -89329,6 +89329,19 @@ void ds4_test_use_glm53_shape(int on) {
     }
 }
 
+void ds4_test_use_qwen4_shape(int on) {
+    static ds4_shape saved;
+    static bool active;
+    if (on && !active) {
+        saved = g_ds4_shape;
+        g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+        active = true;
+    } else if (!on && active) {
+        g_ds4_shape = saved;
+        active = false;
+    }
+}
+
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
