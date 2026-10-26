@@ -18,6 +18,9 @@
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
 #define DS4_KVSTORE_EXT_AGENT_INPUT       (1u << 4)
 #define DS4_KVSTORE_AGENT_VERSION         2u
+/* Auxiliary (never a key-kind) bit: the trailer begins with a tokenizer
+ * fingerprint section the loader can reject on before touching the payload. */
+#define DS4_KVSTORE_EXT_TOKFP             (1u << 5)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
