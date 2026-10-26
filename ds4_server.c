@@ -3120,14 +3120,20 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
                                         const tool_schema_orders *tool_orders) {
     if (!calls || calls->len == 0) return;
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        buf_puts(b, calls->raw_tool_text);
+        static const char *const tags[] = {
+            "<tool_call>", "</tool_call>",
+            "<function=", "</function>",
+            "<parameter=", "</parameter>",
+        };
+        append_raw_tool_text_tags(b, calls->raw_tool_text, tags,
+                                  sizeof(tags) / sizeof(tags[0]));
         return;
     }
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order = tool_schema_orders_find(tool_orders, tc->name);
-        if (i == 0) buf_puts(b, has_content ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=");
-        else buf_puts(b, "\n<tool_call>\n<function=");
+        if (i == 0) buf_puts_special(b, has_content ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=");
+        else buf_puts_special(b, "\n<tool_call>\n<function=");
         buf_puts(b, tc->name ? tc->name : "");
         buf_puts(b, ">\n");
         json_args args = {0};
@@ -3144,7 +3150,7 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
                     }
                     const json_arg *arg = &args.v[idx];
                     args.v[idx].used = true;
-                    buf_puts(b, "<parameter=");
+                    buf_puts_special(b, "<parameter=");
                     append_glm_tag_body_text(b, arg->key, ">");
                     buf_puts(b, ">\n");
                     if (arg->is_string) {
@@ -3154,16 +3160,16 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
                         append_glm_tag_body_text(b, min && min[0] ? min : "null", "</parameter>");
                         free(min);
                     }
-                    buf_puts(b, "\n</parameter>\n");
+                    buf_puts_special(b, "\n</parameter>\n");
                 }
             }
             json_args_free(&args);
         } else if (tc->arguments && tc->arguments[0]) {
-            buf_puts(b, "<parameter=arguments>\n");
+            buf_puts_special(b, "<parameter=arguments>\n");
             append_glm_tag_body_text(b, tc->arguments, "</parameter>");
-            buf_puts(b, "\n</parameter>\n");
+            buf_puts_special(b, "\n</parameter>\n");
         }
-        buf_puts(b, "</function>\n</tool_call>");
+        buf_puts_special(b, "</function>\n</tool_call>");
     }
 }
 
@@ -3586,7 +3592,7 @@ static char *render_deepseek41_chat_masked(const chat_msgs *msgs, int start,
 }
 
 static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
-    buf_puts(b, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    buf_puts_special(b, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
     const char *p = tool_schemas ? tool_schemas : "";
     json_ws(&p);
     while (*p) {
@@ -3607,7 +3613,7 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
         free(raw);
         json_ws(&p);
     }
-    buf_puts(b,
+    buf_puts_special(b,
         "\n</tools>\n\n"
         "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
         "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
@@ -3624,9 +3630,9 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
 
 static void append_qwen_tool_response(buf *b, const char *text, size_t len) {
     char *body = xstrndup(text ? text : "", len);
-    buf_puts(b, "\n<tool_response>\n");
+    buf_puts_special(b, "\n<tool_response>\n");
     append_glm_tag_body_text(b, body, "</tool_response>");
-    buf_puts(b, "\n</tool_response>");
+    buf_puts_special(b, "\n</tool_response>");
     free(body);
 }
 
@@ -3665,26 +3671,26 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
         while (end > content && isspace((unsigned char)end[-1])) end--;
         buf_append(&body, end, strlen(end));
     }
-    buf_puts(out, "<|im_start|>assistant\n");
+    buf_puts_special(out, "<|im_start|>assistant\n");
     if (!text_starts_with_think_tag(content)) {
         /* an empty reasoning block is exactly the no-thinking generation prompt */
-        buf_puts(out, "<think>\n");
+        buf_puts_special(out, "<think>\n");
         append_trimmed_text(out, reasoning);
         /* sampled tool text already carries what the model emitted after its
          * own </think>; the template separator would double it */
         const bool sampled_after_think = !has_content && reasoning[0] &&
             m->calls.raw_tool_text && m->calls.raw_tool_text[0];
-        buf_puts(out, sampled_after_think ? "\n</think>" : "\n</think>\n\n");
+        buf_puts_special(out, sampled_after_think ? "\n</think>" : "\n</think>\n\n");
     }
     buf_puts(out, body.ptr ? body.ptr : "");
     buf_free(&body);
     append_qwen_tool_calls_text(out, m ? &m->calls : NULL, has_content, tool_orders);
-    buf_puts(out, "<|im_end|>\n");
+    buf_puts_special(out, "<|im_end|>\n");
 }
 
 static void append_qwen_generation_prompt(buf *out, bool think) {
-    buf_puts(out, think ? "<|im_start|>assistant\n<think>\n"
-                        : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    buf_puts_special(out, think ? "<|im_start|>assistant\n<think>\n"
+                                : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
 static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
@@ -3695,34 +3701,34 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) continue;
         if (chat_msg_is_glm_tool_result(m)) {
-            if (!tool_open) buf_puts(out, "<|im_start|>user");
+            if (!tool_open) buf_puts_special(out, "<|im_start|>user");
             append_qwen_tool_result_message(out, m);
             tool_open = true;
             pending_assistant = true;
             continue;
         }
         if (tool_open) {
-            buf_puts(out, "<|im_end|>\n");
+            buf_puts_special(out, "<|im_end|>\n");
             tool_open = false;
         }
         if (!strcmp(m->role, "user")) {
-            buf_puts(out, "<|im_start|>user\n");
+            buf_puts_special(out, "<|im_start|>user\n");
             append_trimmed_text(out, m->content);
-            buf_puts(out, "<|im_end|>\n");
+            buf_puts_special(out, "<|im_end|>\n");
             pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
             append_qwen_assistant_message(out, m, tool_orders);
             pending_assistant = false;
         }
     }
-    if (tool_open) buf_puts(out, "<|im_end|>\n");
+    if (tool_open) buf_puts_special(out, "<|im_end|>\n");
     if (pending_assistant) append_qwen_generation_prompt(out, think);
 }
 
-static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
-                                          const char *tool_schemas,
-                                          const tool_schema_orders *tool_orders,
-                                          ds4_think_mode think_mode) {
+static char *render_qwen_chat_prompt_text_impl(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted_out) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const char *effort = think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
     const bool have_tools = tool_schemas && tool_schemas[0];
@@ -3734,8 +3740,9 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
         append_trimmed_text(&system, m->content);
     }
     buf out = {0};
+    if (trusted_out) buf_track_trusted(&out);
     if (have_tools || system.len || effort) {
-        buf_puts(&out, "<|im_start|>system\n");
+        buf_puts_special(&out, "<|im_start|>system\n");
         bool wrote = false;
         if (effort) {
             buf_puts(&out, effort);
@@ -3750,11 +3757,27 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
             if (wrote) buf_puts(&out, "\n\n");
             buf_puts(&out, system.ptr);
         }
-        buf_puts(&out, "<|im_end|>\n");
+        buf_puts_special(&out, "<|im_end|>\n");
     }
     buf_free(&system);
     append_qwen_conversation(&out, msgs, 0, tool_orders, think);
-    return buf_take(&out);
+    return trusted_out ? buf_take_masked(&out, trusted_out) : buf_take(&out);
+}
+
+static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
+                                          const char *tool_schemas,
+                                          const tool_schema_orders *tool_orders,
+                                          ds4_think_mode think_mode) {
+    return render_qwen_chat_prompt_text_impl(msgs, tool_schemas, tool_orders,
+                                             think_mode, NULL);
+}
+
+static char *render_qwen_chat_prompt_text_masked(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted) {
+    return render_qwen_chat_prompt_text_impl(msgs, tool_schemas, tool_orders,
+                                             think_mode, trusted);
 }
 
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
@@ -3784,9 +3807,15 @@ static char *render_chat_prompt_text_for_syntax_masked(server_model_syntax synta
                                                        const tool_schema_orders *tool_orders,
                                                        ds4_think_mode think_mode,
                                                        unsigned char **trusted) {
+    if (syntax == SERVER_MODEL_SYNTAX_GLM)
+        return render_glm_chat_prompt_text_masked(msgs, tool_schemas,
+                                                  tool_orders, think_mode, trusted);
     if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
         return render_deepseek41_chat_masked(msgs, 0, tool_schemas, think_mode,
                                              false, trusted);
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN)
+        return render_qwen_chat_prompt_text_masked(msgs, tool_schemas,
+                                                   tool_orders, think_mode, trusted);
     if (trusted) *trusted = NULL;
     return render_chat_prompt_text_for_syntax(syntax, msgs, tool_schemas,
                                               tool_orders, think_mode);
@@ -3802,11 +3831,17 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static bool syntax_uses_trusted_mask(server_model_syntax syntax) {
+    return syntax == SERVER_MODEL_SYNTAX_GLM ||
+           syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41 ||
+           syntax == SERVER_MODEL_SYNTAX_QWEN;
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
                                                char *err, size_t errlen) {
-    if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41 && !r->prompt_trusted) {
+    if (syntax_uses_trusted_mask(r->model_syntax) && !r->prompt_trusted) {
         snprintf(err, errlen, "internal: chat prompt has no trusted marker mask");
         return false;
     }
@@ -4021,13 +4056,31 @@ static char *render_glm_live_tool_tail_masked(
 
 /* Continue a live session after the model's tool-call turn: its <|im_end|>
  * was the stop token and is not in the KV yet. */
+static char *render_qwen_live_tool_tail_impl(
+        const chat_msgs *msgs, int start,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted_out) {
+    buf out = {0};
+    if (trusted_out) buf_track_trusted(&out);
+    buf_puts_special(&out, "<|im_end|>\n");
+    append_qwen_conversation(&out, msgs, start, tool_orders,
+                             ds4_think_mode_enabled(think_mode));
+    return trusted_out ? buf_take_masked(&out, trusted_out) : buf_take(&out);
+}
+
 static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         const tool_schema_orders *tool_orders,
                                         ds4_think_mode think_mode) {
-    buf out = {0};
-    buf_puts(&out, "<|im_end|>\n");
-    append_qwen_conversation(&out, msgs, start, tool_orders, ds4_think_mode_enabled(think_mode));
-    return buf_take(&out);
+    return render_qwen_live_tool_tail_impl(msgs, start, tool_orders,
+                                           think_mode, NULL);
+}
+
+static char *render_qwen_live_tool_tail_masked(
+        const chat_msgs *msgs, int start,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted) {
+    return render_qwen_live_tool_tail_impl(msgs, start, tool_orders,
+                                           think_mode, trusted);
 }
 
 static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
@@ -4052,14 +4105,29 @@ static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
                                             msgs, start, NULL, think_mode);
 }
 
+static char *render_live_tool_tail_for_syntax_masked(
+        server_model_syntax syntax, const chat_msgs *msgs, int start,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        unsigned char **trusted) {
+    if (syntax == SERVER_MODEL_SYNTAX_GLM)
+        return render_glm_live_tool_tail_masked(msgs, start, tool_orders,
+                                                think_mode, trusted);
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN)
+        return render_qwen_live_tool_tail_masked(msgs, start, tool_orders,
+                                                 think_mode, trusted);
+    if (trusted) *trusted = NULL;
+    return render_live_tool_tail_for_syntax(syntax, msgs, start,
+                                            tool_orders, think_mode);
+}
+
 static char *render_request_live_tool_tail(server *s, const request *r,
                                            const chat_msgs *msgs, int start,
                                            const stop_list *ids,
                                            unsigned char **trusted) {
     if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK41) {
-        if (trusted) *trusted = NULL;
-        return render_live_tool_tail_for_syntax(r->model_syntax, msgs, start,
-                                                 &r->tool_orders, r->think_mode);
+        return render_live_tool_tail_for_syntax_masked(r->model_syntax, msgs,
+                                                       start, &r->tool_orders,
+                                                       r->think_mode, trusted);
     }
     /* Output-only requests omit the assistant message which declares order.
      * Copy the remembered order under its mutex, never borrow mutable IDs. */
@@ -5929,7 +5997,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     chat_msgs_push(&msgs, user_msg);
     r->prompt_text = render_chat_prompt_text_for_syntax_masked(
         r->model_syntax, &msgs, NULL, NULL, r->think_mode, &r->prompt_trusted);
-    if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41 && !r->prompt_trusted) {
+    if (syntax_uses_trusted_mask(r->model_syntax) && !r->prompt_trusted) {
         snprintf(err, errlen, "internal: chat prompt has no trusted marker mask");
         goto bad;
     }
