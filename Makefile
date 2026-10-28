@@ -931,7 +931,7 @@ tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image
 	$(CC) $(CFLAGS) -o $@ $^ -lm -framework ImageIO -framework CoreGraphics -framework CoreFoundation
 
 tests/test_media_video: tests/test_media_video.c ds4_media.c ds4_media.h ds4_image.o
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_video.c ds4_media.c ds4_image.o -lm
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_video.c ds4_media.c ds4_image.o -lm -framework ImageIO -framework CoreGraphics -framework CoreFoundation
 
 tests/test_vision_budget.o: tests/test_vision_budget.c ds4_image.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<

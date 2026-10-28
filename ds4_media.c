@@ -171,6 +171,37 @@ static bool run_quiet(const char *exe, char *const argv[], const char *log_path)
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+/* Container duration in seconds via the ffprobe beside ffmpeg; 0 if unknown. */
+static double media_probe_duration(const char *ffmpeg, const char *input, const char *dir) {
+    char probe[PATH_MAX], outp[PATH_MAX];
+    const char *slash = strrchr(ffmpeg, '/');
+    if (slash) snprintf(probe, sizeof probe, "%.*sffprobe", (int)(slash - ffmpeg + 1), ffmpeg);
+    else snprintf(probe, sizeof probe, "ffprobe");
+    snprintf(outp, sizeof outp, "%s/duration.txt", dir);
+    char *const argv[] = {probe, "-v", "error", "-show_entries", "format=duration",
+                          "-of", "default=noprint_wrappers=1:nokey=1", (char *)input, NULL};
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, outp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    const int rc = posix_spawnp(&pid, probe, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    double d = 0;
+    if (rc == 0) {
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        FILE *f = fopen(outp, "r");
+        if (f) {
+            if (fscanf(f, "%lf", &d) != 1 || !(d > 0)) d = 0;
+            fclose(f);
+        }
+    }
+    unlink(outp);
+    return d;
+}
+
 bool ds4_media_ffmpeg_available(const char *ffmpeg) {
     static int cached = -1;
     if (cached < 0) {
@@ -214,7 +245,7 @@ bool ds4_media_video_frames(const char *ffmpeg, const char *path,
     *count = 0;
     if (dropped) *dropped = 0;
     if (duration_sec) *duration_sec = 0;
-    const double fps = opts && opts->fps > 0 ? opts->fps : 1.0;
+    double fps = opts && opts->fps > 0 ? opts->fps : 1.0;
     const int max_frames = opts && opts->max_frames > 0 ? opts->max_frames : 256;
     const int max_side = opts && opts->max_side > 0 ? opts->max_side : 1722;
     const double dedupe = !opts || opts->dedupe == 0 ? 2.0 : opts->dedupe;
@@ -237,6 +268,15 @@ bool ds4_media_video_frames(const char *ffmpeg, const char *path,
         ok = fp && fwrite(data, 1, len, fp) == len;
         if (fp) fclose(fp);
         if (!ok) media_err(err, errlen, "cannot stage the video%s", NULL);
+    }
+    /* Cover the whole clip: when duration * fps would exceed max_frames, lower
+     * the rate so the frames spread over the full video instead of stopping
+     * after its first max_frames / fps seconds. */
+    if (ok) {
+        double span = opts && opts->duration_sec > 0 ? opts->duration_sec
+                                                     : media_probe_duration(ffmpeg, input, dir);
+        if (opts && opts->start_sec > 0 && !(opts->duration_sec > 0)) span -= opts->start_sec;
+        if (span > 0 && span * fps > max_frames) fps = max_frames / span;
     }
     char vf[256], nframes[32], ss[32], tt[32];
     snprintf(vf, sizeof vf,
