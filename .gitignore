@@ -130,3 +130,4 @@ __pycache__/
 /tests/test_vision_state_restore
 /tests/test_kvstore_rewrite
 /tests/test_q8_row_batch
+tests/bench_deepseek4_vision

@@ -151,6 +151,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
         opt(fp, c, "--vision-max-tokens N|native", "Default image token budget (default: the model's, 1024 for V4.1). native = no downscaling. Per image: image_url.detail = low (256) or native, or image_url.max_tokens = N|native.");
         opt(fp, c, "--max-images N", "Images allowed per request (default 16, 0 = unlimited).");
+        opt(fp, c, "--video", "Accept video_url content (frames sampled by an external ffmpeg).");
+        opt(fp, c, "--video-tokens N", "Default image-token budget per video, spread over its frames (default 32768).");
+        opt(fp, c, "--ffmpeg PATH", "ffmpeg executable for --video (default: ffmpeg on PATH).");
+        opt(fp, c, "--media-root DIR", "Allow file:// image/video URLs under DIR.");
     }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");

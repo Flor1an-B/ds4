@@ -5,6 +5,7 @@
 #include "ds4_help.h"
 #include "ds4_image.h"
 #include "ds4_kvstore.h"
+#include "ds4_media.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -624,6 +625,46 @@ static bool server_image_inputs_push_data_uri(
         return server_image_inputs_push_base64(
             images, "image/webp", uri + sizeof(webp) - 1, marker);
     return false;
+}
+
+/* Media options (ds4-server --media-root / --video / --ffmpeg / --video-tokens). Request
+ * parsing has no server pointer, so these are process-wide like the other parse knobs. */
+static const char *g_media_root = NULL;
+static bool g_video_enabled = false;
+static const char *g_ffmpeg_path = "ffmpeg";
+static uint32_t g_video_total_tokens = 32768u;
+
+static bool server_image_inputs_push_owned(server_image_inputs *images, uint8_t *encoded,
+                                           size_t encoded_len, uint32_t max_tokens,
+                                           char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    /* Reuse the base64 path's marker generation by pushing an empty placeholder. */
+    server_image_input image = {0};
+    image.encoded = encoded;
+    image.encoded_len = encoded_len;
+    image.max_tokens = max_tokens;
+    unsigned char nonce[12];
+    if (!random_bytes(nonce, sizeof(nonce))) {
+        uint64_t fallback = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^
+                            (uint64_t)(uintptr_t)encoded ^ (uint64_t)images->len;
+        memcpy(nonce, &fallback, sizeof(fallback));
+        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker), "\036" "DS4_IMAGE_");
+    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
+        image.marker[pos++] = hex[nonce[i] >> 4];
+        image.marker[pos++] = hex[nonce[i] & 15];
+    }
+    image.marker[pos++] = '\x1f';
+    image.marker[pos] = '\0';
+    if (images->len == images->cap) {
+        size_t cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
+        images->cap = cap;
+    }
+    images->v[images->len++] = image;
+    snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
+    return true;
 }
 
 static void append_owned_text(char **dst, const char *text) {
@@ -2187,6 +2228,121 @@ static bool parse_image_url_value_budget(const char **p, char **url, uint32_t *b
     return *url != NULL;
 }
 
+/* {"url": ..., "fps": 1, "max_frames": 256, "max_tokens": per-frame budget | "native",
+ *  "total_tokens": budget for the whole video, "start": s, "duration": s, "dedupe": 2.0,
+ *  "max_side": px} */
+static bool parse_video_url_value(const char **p, char **url, ds4_media_video_opts *o,
+                                  uint32_t *frame_budget, uint32_t *total_tokens) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, url);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') { free(key); return false; }
+        (*p)++;
+        bool ok = true;
+        double num = 0;
+        if (!strcmp(key, "url")) {
+            char *next = NULL;
+            ok = json_string(p, &next);
+            if (ok) { free(*url); *url = next; }
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "detail")) {
+            ok = parse_image_budget_value(p, frame_budget);
+        } else if (!strcmp(key, "fps")) {
+            ok = json_number(p, &num); o->fps = num;
+        } else if (!strcmp(key, "max_frames")) {
+            ok = json_number(p, &num); o->max_frames = (int)num;
+        } else if (!strcmp(key, "total_tokens")) {
+            ok = json_number(p, &num); *total_tokens = num > 0 ? (uint32_t)num : 0;
+        } else if (!strcmp(key, "start")) {
+            ok = json_number(p, &num); o->start_sec = num;
+        } else if (!strcmp(key, "duration")) {
+            ok = json_number(p, &num); o->duration_sec = num;
+        } else if (!strcmp(key, "dedupe")) {
+            ok = json_number(p, &num); o->dedupe = num;
+        } else if (!strcmp(key, "max_side")) {
+            ok = json_number(p, &num); o->max_side = (int)num;
+        } else {
+            ok = json_skip_value(p);
+        }
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return *url != NULL;
+}
+
+/* Expand a video into timestamped frame images appended to the message. The per-frame
+ * budget defaults to the video's total budget spread over the kept frames. */
+static bool server_append_video(chat_msg *msg, const char *url,
+                                const ds4_media_video_opts *opts,
+                                uint32_t frame_budget, uint32_t total_tokens) {
+    char err[256] = {0};
+    if (!g_video_enabled) {
+        fprintf(stderr, "ds4-server: video input rejected: start ds4-server with --video\n");
+        return false;
+    }
+    char path[PATH_MAX];
+    uint8_t *data = NULL;
+    size_t len = 0;
+    char mime[64] = {0};
+    const bool is_file = url && !strncmp(url, "file://", 7);
+    if (is_file) {
+        if (!ds4_media_resolve_file_url(url, g_media_root, path, err, sizeof err)) {
+            fprintf(stderr, "ds4-server: video: %s\n", err);
+            return false;
+        }
+    } else if (!ds4_media_load_url(url, g_media_root, &data, &len, mime, err, sizeof err)) {
+        fprintf(stderr, "ds4-server: video: %s\n", err);
+        return false;
+    }
+    ds4_media_frame *frames = NULL;
+    int count = 0, dropped = 0;
+    double duration = 0;
+    const bool ok = ds4_media_video_frames(g_ffmpeg_path, is_file ? path : NULL, data, len, opts,
+                                           &frames, &count, &dropped, &duration,
+                                           err, sizeof err);
+    free(data);
+    if (!ok) {
+        fprintf(stderr, "ds4-server: video: %s\n", err);
+        return false;
+    }
+    if (!frame_budget) {
+        const uint32_t total = total_tokens ? total_tokens : g_video_total_tokens;
+        uint32_t per = total / (uint32_t)count;
+        if (per < 96u) per = 96u;
+        if (per > 4096u) per = 4096u;
+        frame_budget = per;
+    }
+    char head[256];
+    snprintf(head, sizeof head,
+             "[video: %d frames sampled at %.3g fps over %.1f s; %d near-duplicate frames skipped]\n",
+             count, opts && opts->fps > 0 ? opts->fps : 1.0, duration, dropped);
+    append_owned_text(&msg->content, head);
+    for (int i = 0; i < count; i++) {
+        char marker[SERVER_IMAGE_MARKER_BYTES], stamp[48];
+        snprintf(stamp, sizeof stamp, "[t=%.1fs] ", frames[i].t_sec);
+        server_image_inputs_push_owned(&msg->images, frames[i].data, frames[i].len,
+                                       frame_budget, marker);
+        frames[i].data = NULL;   /* ownership moved */
+        append_owned_text(&msg->content, stamp);
+        append_owned_text(&msg->content, marker);
+        append_owned_text(&msg->content, "\n");
+    }
+    ds4_media_frames_free(frames, count);
+    fprintf(stderr, "ds4-server: video expanded: %d frames (%d deduped) %.1f s, %u tokens/frame max\n",
+            count, dropped, duration, frame_budget);
+    return true;
+}
+
 static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '{') return false;
     (*p)++;
@@ -2194,6 +2350,9 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     char *text = NULL;
     char *image_url = NULL;
     uint32_t image_budget = 0;   /* "detail" may sit beside image_url (Responses API) */
+    char *video_url = NULL;
+    ds4_media_video_opts vopts = {0};
+    uint32_t video_frame_budget = 0, video_total = 0;
     json_ws(p);
     while (**p && **p != '}') {
         char *key = NULL;
@@ -2215,7 +2374,11 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
             ok = parse_image_url_value_budget(p, &image_url, &image_budget);
         } else if (!strcmp(key, "detail") || !strcmp(key, "max_tokens"))
             ok = parse_image_budget_value(p, &image_budget);
-        else
+        else if (!strcmp(key, "video_url")) {
+            free(video_url);
+            video_url = NULL;
+            ok = parse_video_url_value(p, &video_url, &vopts, &video_frame_budget, &video_total);
+        } else
             ok = json_skip_value(p);
         free(key);
         if (!ok) goto bad;
@@ -2228,21 +2391,37 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
 
     if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
-            goto bad;
-        msg->images.v[msg->images.len - 1].max_tokens = image_budget;
+        if (image_url && !strncmp(image_url, "file://", 7)) {
+            uint8_t *bytes = NULL;
+            size_t blen = 0;
+            char mime[64], merr[256];
+            if (!ds4_media_load_url(image_url, g_media_root, &bytes, &blen, mime, merr, sizeof merr)) {
+                fprintf(stderr, "ds4-server: image: %s\n", merr);
+                goto bad;
+            }
+            server_image_inputs_push_owned(&msg->images, bytes, blen, image_budget, marker);
+        } else {
+            if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
+                goto bad;
+            msg->images.v[msg->images.len - 1].max_tokens = image_budget;
+        }
         append_owned_text(&msg->content, marker);
+    } else if (type && (!strcmp(type, "video_url") || !strcmp(type, "input_video"))) {
+        if (!server_append_video(msg, video_url, &vopts, video_frame_budget, video_total))
+            goto bad;
     } else if (text) {
         append_owned_text(&msg->content, text);
     }
     free(type);
     free(text);
     free(image_url);
+    free(video_url);
     return true;
 bad:
     free(type);
     free(text);
     free(image_url);
+    free(video_url);
     return false;
 }
 
@@ -18434,6 +18613,14 @@ static server_config parse_options(int argc, char **argv) {
                 c.vision_max_tokens = 0;
             else
                 c.vision_max_tokens = (uint32_t)parse_int_arg(v, arg);
+        } else if (!strcmp(arg, "--media-root")) {
+            g_media_root = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--video")) {
+            g_video_enabled = true;
+        } else if (!strcmp(arg, "--ffmpeg")) {
+            g_ffmpeg_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--video-tokens")) {
+            g_video_total_tokens = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--max-images")) {
             const char *v = need_arg(&i, argc, argv, arg);
             char *end = NULL;
