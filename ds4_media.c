@@ -18,7 +18,7 @@
 
 extern char **environ;
 
-#define DS4_MEDIA_MAX_IMAGE_BYTES (64u * 1024u * 1024u)
+#define DS4_MEDIA_MAX_IMAGE_BYTES (512u * 1024u * 1024u)
 #define DS4_MEDIA_MAX_INLINE_VIDEO (1024u * 1024u * 1024u)
 
 static void media_err(char *err, size_t errlen, const char *fmt, const char *arg) {
@@ -347,6 +347,42 @@ bool ds4_media_video_frames(const char *ffmpeg, const char *path,
     if (dropped) *dropped = skipped;
     if (duration_sec) *duration_sec = (double)nnames / fps;
     return true;
+}
+
+bool ds4_media_is_png_or_jpeg(const uint8_t *data, size_t len) {
+    return (len >= 8 && !memcmp(data, "\x89PNG\r\n\x1a\n", 8)) ||
+           (len >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff);
+}
+
+bool ds4_media_image_to_png(const char *ffmpeg, const uint8_t *data, size_t len,
+                            uint8_t **out, size_t *out_len, char *err, size_t errlen) {
+    *out = NULL;
+    *out_len = 0;
+    if (!ffmpeg || !ffmpeg[0]) ffmpeg = "ffmpeg";
+    if (!ds4_media_ffmpeg_available(ffmpeg)) {
+        media_err(err, errlen, "image is not PNG/JPEG and ffmpeg (%s) is not runnable to convert it", ffmpeg);
+        return false;
+    }
+    char dir[] = "/tmp/ds4-image-XXXXXX";
+    if (!mkdtemp(dir)) { media_err(err, errlen, "mkdtemp failed%s", NULL); return false; }
+    char in[PATH_MAX], outp[PATH_MAX];
+    snprintf(in, sizeof in, "%s/in.bin", dir);
+    snprintf(outp, sizeof outp, "%s/out.png", dir);
+    FILE *fp = fopen(in, "wb");
+    bool ok = fp && fwrite(data, 1, len, fp) == len;
+    if (fp) ok = fclose(fp) == 0 && ok;
+    if (ok) {
+        char *const argv[] = {(char *)ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                              "-i", in, "-frames:v", "1", outp, NULL};
+        ok = run_quiet(ffmpeg, argv, NULL) && read_file(outp, out, out_len, DS4_MEDIA_MAX_IMAGE_BYTES, err, errlen);
+        if (!ok && err && !err[0]) media_err(err, errlen, "ffmpeg could not decode the image%s", NULL);
+    } else {
+        media_err(err, errlen, "cannot stage the image%s", NULL);
+    }
+    unlink(in);
+    unlink(outp);
+    rmdir(dir);
+    return ok;
 }
 
 void ds4_media_frames_free(ds4_media_frame *frames, int count) {

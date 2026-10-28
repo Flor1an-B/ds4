@@ -51,4 +51,12 @@ bool ds4_media_resolve_file_url(const char *url, const char *media_root, char ou
 /* True when `ffmpeg` can be executed (cached after the first probe). */
 bool ds4_media_ffmpeg_available(const char *ffmpeg);
 
+/* PNG or JPEG magic: the formats the image decoder reads natively. */
+bool ds4_media_is_png_or_jpeg(const uint8_t *data, size_t len);
+
+/* Convert any ffmpeg-decodable still image (WebP, GIF, BMP, TIFF, HEIC, ...)
+ * to PNG; the first frame of an animation. Caller frees *out. */
+bool ds4_media_image_to_png(const char *ffmpeg, const uint8_t *data, size_t len,
+                            uint8_t **out, size_t *out_len, char *err, size_t errlen);
+
 #endif

@@ -2391,19 +2391,35 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
 
     if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (image_url && !strncmp(image_url, "file://", 7)) {
+        if (image_url && !strncmp(image_url, "data:", 5) &&
+            server_image_inputs_push_data_uri(&msg->images, image_url, marker)) {
+            msg->images.v[msg->images.len - 1].max_tokens = image_budget;
+        } else if (image_url && (!strncmp(image_url, "file://", 7) || !strncmp(image_url, "data:", 5))) {
+            /* file:// images, and data: images in formats the decoder lacks
+             * (WebP, GIF, BMP, HEIC, ...), which ffmpeg converts to PNG. */
             uint8_t *bytes = NULL;
             size_t blen = 0;
-            char mime[64], merr[256];
+            char mime[64], merr[256] = {0};
             if (!ds4_media_load_url(image_url, g_media_root, &bytes, &blen, mime, merr, sizeof merr)) {
                 fprintf(stderr, "ds4-server: image: %s\n", merr);
                 goto bad;
             }
+            if (!ds4_media_is_png_or_jpeg(bytes, blen)) {
+                uint8_t *png = NULL;
+                size_t plen = 0;
+                const bool conv = ds4_media_image_to_png(g_ffmpeg_path, bytes, blen, &png, &plen,
+                                                         merr, sizeof merr);
+                free(bytes);
+                if (!conv) {
+                    fprintf(stderr, "ds4-server: image (%s): %s\n", mime, merr);
+                    goto bad;
+                }
+                bytes = png;
+                blen = plen;
+            }
             server_image_inputs_push_owned(&msg->images, bytes, blen, image_budget, marker);
         } else {
-            if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
-                goto bad;
-            msg->images.v[msg->images.len - 1].max_tokens = image_budget;
+            goto bad;
         }
         append_owned_text(&msg->content, marker);
     } else if (type && (!strcmp(type, "video_url") || !strcmp(type, "input_video"))) {
@@ -17853,7 +17869,7 @@ static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
+    const size_t max_body = (size_t)2 << 30; /* many native-size images or an inline video */
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
