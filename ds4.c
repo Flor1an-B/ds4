@@ -41322,6 +41322,7 @@ typedef struct {
 typedef struct ds41_dspark ds41_dspark;
 static void ds41_dspark_free(ds41_dspark *d);
 static void ds41_dspark_reset(ds41_dspark *d);
+static void ds41_dspark_truncate(ds41_dspark *d, uint32_t pos);
 static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows);
 
@@ -41410,9 +41411,11 @@ typedef struct {
      * position, so a session can be rewound (ds41_graph_rewind) with the
      * decode window rebuilt from it: the window itself only keeps 128 rows.
      * raw_log_from is the first position the ring has held since the last
-     * reset or snapshot load. */
+     * reset or snapshot load; raw_log_hi is the highest position the graph
+     * stood at before a ds41_graph_rewind (rows past the current position
+     * may still have been written and so may have overwritten older slots). */
     ds4_gpu_tensor *raw_log[40];
-    uint32_t raw_log_rows, raw_log_from;
+    uint32_t raw_log_rows, raw_log_from, raw_log_hi;
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
@@ -41547,7 +41550,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
-    g->raw_log_from = 0;
+    g->raw_log_from = g->raw_log_hi = 0;
     ds4_engram_history_reset(&g->history);
     ds41_dspark_reset(g->dspark);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
@@ -42156,14 +42159,24 @@ static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_ten
  * are addressed by valid length, so the rows past `pos` are simply never read
  * again, and the odd-row pair state is rewritten by the next even token; the
  * decode windows are rebuilt from the rewind ring, which must still hold the
- * rows before `pos`. `tokens` is the session's full token history. */
+ * rows before `pos`. `tokens` is the session's full token history.
+ *
+ * A ring slot is reused by the position raw_log_rows above it. Rows may have
+ * been written past the current position: DSpark verification writes up to
+ * DS41_VERIFY_ROWS rows ahead before committing a prefix, and an earlier
+ * rewind left the rows of the abandoned tail behind. raw_log_hi plus the
+ * slack bounds every position written so far. */
+#define DS41_RAW_LOG_SLACK 8u
 static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos) {
     if (!g->valid || pos > g->pos || (pos & 1u)) return false;
     if (pos < g->pos) {
         const uint32_t need = pos < 128u ? pos : 128u;
         const uint32_t from = pos - need;
+        const uint32_t hi = (g->raw_log_hi > g->pos ? g->raw_log_hi : g->pos) +
+                            DS41_RAW_LOG_SLACK;
         if (need && (!g->raw_log_rows || from < g->raw_log_from ||
-                     g->pos - from >= g->raw_log_rows)) return false;
+                     hi - from > g->raw_log_rows)) return false;
+        g->raw_log_hi = hi - DS41_RAW_LOG_SLACK;
         const uint64_t rb = 512u * sizeof(float);
         bool ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < 40 && need; il++) {
@@ -42184,6 +42197,7 @@ static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos
     ds4_engram_history_reset(&g->history);
     for (uint32_t i = 0; i < 3 && i < pos; i++)
         g->history.tail[i] = (int32_t)g->token_map[tokens[pos - 1u - i]];
+    ds41_dspark_truncate(g->dspark, pos);
     return true;
 }
 
@@ -64859,7 +64873,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
-            g->raw_log_from = pos;
+            g->raw_log_from = g->raw_log_hi = pos;
             ds4_tokens_copy(&s->checkpoint, &tokens);
             s->checkpoint_valid = true;
         }

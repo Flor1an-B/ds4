@@ -13650,6 +13650,17 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
+    if (ds41_rewind && token_image_prefix && common < live_pos &&
+        common < req->prompt.len) {
+        const int diverged_to = live_prefix_rewind_target(true, 2, live_pos,
+                                                          req->prompt.len, common);
+        if (diverged_to >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = diverged_to;
+            return pr;
+        }
+    }
+
     return pr;
 }
 
@@ -14610,8 +14621,15 @@ static int server_generation_rewind(server *s, server_slot *slot,
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
-    bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
+    const int common = ds4_session_common_prefix(slot->session, &prefix);
+    const bool rebuild = common != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
+    /* V4.1 rewinds in place (odd targets included); a rebuild of a long
+     * prefix here looks exactly like a hang, so say so if one happens. */
+    if (rebuild && prefix.len - common > 8 && ds4_engine_is_deepseek41(s->engine))
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: generation rewind to %d lost the live state; re-prefilling %d tokens",
+                   pos, prefix.len - common);
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
