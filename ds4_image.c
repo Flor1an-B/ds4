@@ -298,6 +298,13 @@ webp_done:
 }
 #endif
 
+void ds4_image_sha256(const void *const *parts, const size_t *lens, size_t n, uint8_t out[32]) {
+    ds4_sha256 sha;
+    ds4_sha256_init(&sha);
+    for (size_t i = 0; i < n; i++) ds4_sha256_update(&sha, parts[i], lens[i]);
+    ds4_sha256_final(&sha, out);
+}
+
 void ds4_image_fingerprint_with_grid(uint8_t fingerprint[32], uint32_t grid_h, uint32_t grid_w) {
     static const char tag[] = "ds4-image-grid";
     ds4_sha256 sha;

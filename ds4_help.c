@@ -153,6 +153,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "--max-images N", "Images allowed per request (default 16, 0 = unlimited).");
         opt(fp, c, "--video", "Accept video_url content (frames sampled by an external ffmpeg).");
         opt(fp, c, "--video-tokens N", "Default image-token budget per video, spread over its frames (default 32768).");
+        opt(fp, c, "--image-cache-dir DIR", "Persist vision embeddings on disk; repeated images skip the encoder across requests and restarts.");
+        opt(fp, c, "--image-cache-disk-gb N", "Disk cap for --image-cache-dir, pruned oldest-first (default 64).");
+        opt(fp, c, "--image-cache-mb N", "In-memory vision embedding cache size (default 128).");
         opt(fp, c, "--ffmpeg PATH", "ffmpeg executable for --video (default: ffmpeg on PATH).");
         opt(fp, c, "--media-root DIR", "Allow file:// image/video URLs under DIR.");
     }

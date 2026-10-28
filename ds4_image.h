@@ -125,6 +125,9 @@ int ds4_image_preprocess_deepseek41_budget(
  * embeddings of the same image at different budgets never share a cache identity. */
 void ds4_image_fingerprint_with_grid(uint8_t fingerprint[32], uint32_t grid_h, uint32_t grid_w);
 
+/* SHA-256 over n concatenated byte ranges. */
+void ds4_image_sha256(const void *const *parts, const size_t *lens, size_t n, uint8_t out[32]);
+
 /* LLM tokens a DeepSeek image would cost at a given budget, without preprocessing
  * (0 on failure). Lets callers plan context and video frame budgets. */
 uint32_t ds4_image_deepseek_token_cost(uint32_t width, uint32_t height,

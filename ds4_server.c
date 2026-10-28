@@ -6,6 +6,7 @@
 #include "ds4_image.h"
 #include "ds4_kvstore.h"
 #include "ds4_media.h"
+#include "ds4_image.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -11713,7 +11714,7 @@ struct server_slot {
     char decode_err[160];
 };
 
-#define SERVER_IMAGE_CACHE_ENTRIES 32
+#define SERVER_IMAGE_CACHE_ENTRIES 256
 #define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
 
 typedef struct {
@@ -11812,6 +11813,206 @@ static void server_image_cache_put(server_image_cache *cache,
 }
 
 static bool id_list_contains(const stop_list *ids, const char *id);
+/* Persistent vision-embedding cache (--image-cache-dir). Each entry is one file
+ * named by sha256(format tag, model name, row width, budget, encoded bytes),
+ * so a re-sent image, a re-run batch, or a restarted server skips the encoder.
+ * Rows are stored as bf16 when that is lossless (every float's low 16 bits are
+ * zero), otherwise as f32. Writes go to a temp file and rename, so readers
+ * never see a partial entry. The directory is pruned oldest-first (by mtime;
+ * hits touch it) once it exceeds --image-cache-disk-gb. */
+static size_t g_image_cache_mem_bytes = SERVER_IMAGE_CACHE_BYTES;
+static const char *g_image_cache_dir = NULL;
+static uint64_t g_image_cache_disk_cap = 64ull << 30;
+static uint64_t g_image_cache_disk_used = UINT64_MAX; /* lazily scanned */
+
+#define SERVER_IMAGE_DISK_MAGIC "DS4VEMB1"
+
+typedef struct {
+    char magic[8];
+    uint32_t dim, dtype; /* dtype: 0 = f32, 1 = bf16 */
+    uint32_t token_count, layout, grid_width, grid_height;
+    uint32_t width, height, content_width, content_height;
+    uint8_t fingerprint[32];
+} server_image_disk_header;
+
+static void server_image_disk_path(char *out, size_t cap, const char *model,
+                                   uint32_t dim, const server_image_input *input) {
+    static const char tag[] = "ds4-vision-embedding-v1";
+    const void *parts[] = {tag, model, &dim, &input->max_tokens, input->encoded};
+    const size_t lens[] = {sizeof(tag), strlen(model) + 1, sizeof(dim),
+                           sizeof(input->max_tokens), input->encoded_len};
+    uint8_t h[32];
+    char hex[65];
+    ds4_image_sha256(parts, lens, 5, h);
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+    snprintf(out, cap, "%s/%.2s/%s.emb", g_image_cache_dir, hex, hex);
+}
+
+static bool server_image_disk_get(const char *model, uint32_t dim,
+                                  const server_image_input *input,
+                                  ds4_vision_embedding *out) {
+    if (!g_image_cache_dir || !dim) return false;
+    char path[PATH_MAX];
+    server_image_disk_path(path, sizeof path, model, dim, input);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    server_image_disk_header h;
+    bool ok = fread(&h, sizeof h, 1, f) == 1 &&
+              !memcmp(h.magic, SERVER_IMAGE_DISK_MAGIC, 8) && h.dim == dim &&
+              h.dtype <= 1 && h.token_count && h.token_count < (1u << 24);
+    float *data = NULL;
+    if (ok) {
+        const size_t n = (size_t)h.token_count * dim;
+        data = malloc(n * sizeof(float));
+        ok = data != NULL;
+        if (ok && h.dtype == 0) {
+            ok = fread(data, sizeof(float), n, f) == n;
+        } else if (ok) {
+            /* Read bf16 into the upper half, then widen front to back: element
+             * i's f32 slot (bytes 4i..4i+3) never overlaps an unread bf16 at
+             * 2n+2j for j >= i. */
+            uint16_t *src = (uint16_t *)data + n;
+            ok = fread(src, sizeof(uint16_t), n, f) == n;
+            for (size_t i = 0; ok && i < n; i++) {
+                const uint32_t bits = (uint32_t)src[i] << 16;
+                memcpy(&data[i], &bits, sizeof bits);
+            }
+        }
+    }
+    fclose(f);
+    if (!ok) {
+        free(data);
+        unlink(path);
+        return false;
+    }
+    memset(out, 0, sizeof *out);
+    out->data = data;
+    out->token_count = h.token_count;
+    out->layout = h.layout;
+    out->grid_width = h.grid_width;
+    out->grid_height = h.grid_height;
+    out->width = h.width;
+    out->height = h.height;
+    out->content_width = h.content_width;
+    out->content_height = h.content_height;
+    memcpy(out->fingerprint, h.fingerprint, 32);
+    utimes(path, NULL);
+    return true;
+}
+
+typedef struct { char *path; time_t mtime; off_t size; } server_image_disk_file;
+
+static int server_image_disk_file_cmp(const void *a, const void *b) {
+    const time_t x = ((const server_image_disk_file *)a)->mtime;
+    const time_t y = ((const server_image_disk_file *)b)->mtime;
+    return x < y ? -1 : x > y;
+}
+
+/* Walk the two-level layout; with prune, delete oldest until under 90% of cap. */
+static void server_image_disk_scan(bool prune) {
+    DIR *top = opendir(g_image_cache_dir);
+    if (!top) {
+        g_image_cache_disk_used = 0;
+        return;
+    }
+    server_image_disk_file *files = NULL;
+    size_t n = 0, cap = 0;
+    uint64_t total = 0;
+    struct dirent *d;
+    while ((d = readdir(top))) {
+        if (strlen(d->d_name) != 2) continue;
+        char sub[PATH_MAX];
+        snprintf(sub, sizeof sub, "%s/%s", g_image_cache_dir, d->d_name);
+        DIR *sd = opendir(sub);
+        if (!sd) continue;
+        struct dirent *e;
+        while ((e = readdir(sd))) {
+            const size_t len = strlen(e->d_name);
+            if (len < 5 || strcmp(e->d_name + len - 4, ".emb")) continue;
+            char p[PATH_MAX];
+            snprintf(p, sizeof p, "%s/%s", sub, e->d_name);
+            struct stat st;
+            if (stat(p, &st)) continue;
+            total += (uint64_t)st.st_size;
+            if (!prune) continue;
+            if (n == cap) {
+                const size_t ncap = cap ? cap * 2 : 256;
+                server_image_disk_file *grown = realloc(files, ncap * sizeof *files);
+                if (!grown) continue;
+                files = grown;
+                cap = ncap;
+            }
+            files[n++] = (server_image_disk_file){strdup(p), st.st_mtime, st.st_size};
+        }
+        closedir(sd);
+    }
+    closedir(top);
+    if (prune && total > g_image_cache_disk_cap) {
+        qsort(files, n, sizeof *files, server_image_disk_file_cmp);
+        const uint64_t target = g_image_cache_disk_cap / 10 * 9;
+        for (size_t i = 0; i < n && total > target; i++) {
+            if (files[i].path && !unlink(files[i].path)) total -= (uint64_t)files[i].size;
+        }
+    }
+    for (size_t i = 0; i < n; i++) free(files[i].path);
+    free(files);
+    g_image_cache_disk_used = total;
+}
+
+static void server_image_disk_put(const char *model, uint32_t dim,
+                                  const server_image_input *input,
+                                  const ds4_vision_embedding *emb) {
+    if (!g_image_cache_dir || !dim || !emb->data || !emb->token_count) return;
+    char path[PATH_MAX], tmp[PATH_MAX + 32];
+    server_image_disk_path(path, sizeof path, model, dim, input);
+    char *slash = strrchr(path, '/');
+    *slash = '\0';
+    mkdir(g_image_cache_dir, 0755);
+    mkdir(path, 0755);
+    *slash = '/';
+    const size_t n = (size_t)emb->token_count * dim;
+    bool bf16 = true;
+    for (size_t i = 0; i < n && bf16; i++) {
+        uint32_t bits;
+        memcpy(&bits, &emb->data[i], sizeof bits);
+        bf16 = (bits & 0xffffu) == 0;
+    }
+    server_image_disk_header h = {
+        .dim = dim, .dtype = bf16 ? 1u : 0u, .token_count = emb->token_count,
+        .layout = emb->layout, .grid_width = emb->grid_width,
+        .grid_height = emb->grid_height, .width = emb->width, .height = emb->height,
+        .content_width = emb->content_width, .content_height = emb->content_height,
+    };
+    memcpy(h.magic, SERVER_IMAGE_DISK_MAGIC, 8);
+    memcpy(h.fingerprint, emb->fingerprint, 32);
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    bool ok = fwrite(&h, sizeof h, 1, f) == 1;
+    if (ok && !bf16) {
+        ok = fwrite(emb->data, sizeof(float), n, f) == n;
+    } else if (ok) {
+        uint16_t buf[4096];
+        for (size_t i = 0; ok && i < n;) {
+            size_t k = 0;
+            for (; k < 4096 && i < n; k++, i++) {
+                uint32_t bits;
+                memcpy(&bits, &emb->data[i], sizeof bits);
+                buf[k] = (uint16_t)(bits >> 16);
+            }
+            ok = fwrite(buf, sizeof(uint16_t), k, f) == k;
+        }
+    }
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, path)) {
+        unlink(tmp);
+        return;
+    }
+    if (g_image_cache_disk_used == UINT64_MAX) server_image_disk_scan(false);
+    else g_image_cache_disk_used += sizeof h + n * (bf16 ? 2 : 4);
+    if (g_image_cache_disk_used > g_image_cache_disk_cap) server_image_disk_scan(true);
+}
+
 static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
@@ -11879,16 +12080,24 @@ static bool server_encode_image(server *s, const server_image_input *input,
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
+    /* Row width must match the encoder's allocation: the mmproj projection
+     * dim is validated to equal the model's n_embd at load (Qwen3.8 is
+     * 2560-wide, not 4096; a wrong width over-reads the source in put). */
+    const uint32_t dim = (uint32_t)ds4_engine_embd_dim(s->engine);
+    const char *model = ds4_engine_model_name(s->engine);
+    if (!model) model = "";
+    if (server_image_disk_get(model, dim, input, out)) {
+        server_image_cache_put(&s->image_cache, input, out, dim, g_image_cache_mem_bytes);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding disk cache hit; tokens=%u",
+                   out->token_count);
+        return true;
+    }
     if (!ds4_engine_vision_encode_memory_budget(s->engine, input->encoded,
                                                 input->encoded_len, input->max_tokens,
                                                 out, err, errlen))
         return false;
-    /* Row width must match the encoder's allocation: the mmproj projection
-     * dim is validated to equal the model's n_embd at load (Qwen3.8 is
-     * 2560-wide, not 4096; a wrong width over-reads the source in put). */
-    server_image_cache_put(&s->image_cache, input, out,
-                            (uint32_t)ds4_engine_embd_dim(s->engine),
-                            SERVER_IMAGE_CACHE_BYTES);
+    server_image_cache_put(&s->image_cache, input, out, dim, g_image_cache_mem_bytes);
+    server_image_disk_put(model, dim, input, out);
     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; tokens=%u grid=%ux%u cache=%zu bytes",
                out->token_count, out->grid_width, out->grid_height, s->image_cache.bytes);
     return true;
@@ -18635,6 +18844,12 @@ static server_config parse_options(int argc, char **argv) {
             g_video_enabled = true;
         } else if (!strcmp(arg, "--ffmpeg")) {
             g_ffmpeg_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--image-cache-dir")) {
+            g_image_cache_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--image-cache-disk-gb")) {
+            g_image_cache_disk_cap = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg) << 30;
+        } else if (!strcmp(arg, "--image-cache-mb")) {
+            g_image_cache_mem_bytes = (size_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg) << 20;
         } else if (!strcmp(arg, "--video-tokens")) {
             g_video_total_tokens = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--max-images")) {
@@ -29712,13 +29927,13 @@ static void test_responses_tool_image_output(void) {
 
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
-    uint8_t key = 1;
+    uint16_t key = 1;   /* wider than SERVER_IMAGE_CACHE_ENTRIES + 1 */
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    server_image_input input = {.encoded = (uint8_t *)&key, .encoded_len = sizeof(key)};
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
-    const size_t budget = 2 * (sizeof(data) + 1);
+    const size_t budget = 2 * (sizeof(data) + sizeof(key));
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_put(&cache, &input, &src, 2, budget);
     TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
@@ -29744,8 +29959,8 @@ static void test_server_image_embedding_cache(void) {
     server_image_cache_clear(&cache);
     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
     for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
-        server_image_cache_put(&cache, &input, &src, 2, 4096);
-    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
+        server_image_cache_put(&cache, &input, &src, 2, SERVER_IMAGE_CACHE_ENTRIES * 64);
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + sizeof(key)));
     key = 1;
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_clear(&cache);
