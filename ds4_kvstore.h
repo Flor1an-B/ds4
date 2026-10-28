@@ -21,6 +21,10 @@
 /* Auxiliary (never a key-kind) bit: the trailer begins with a tokenizer
  * fingerprint section the loader can reject on before touching the payload. */
 #define DS4_KVSTORE_EXT_TOKFP             (1u << 5)
+/* Bit 4 is taken locally by DS4_KVSTORE_EXT_AGENT_INPUT (#1182); upstream's
+ * PR #1295 picked the same bit for an unrelated trailer, so this flag is
+ * reassigned to bit 6 here. */
+#define DS4_KVSTORE_EXT_AGENT_TOKENS      (1u << 6)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
