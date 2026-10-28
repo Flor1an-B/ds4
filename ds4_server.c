@@ -13940,6 +13940,13 @@ static int live_prefix_rewind_target(bool backend_can_rewind, int align,
     return target >= align ? target : -1;
 }
 
+/* True when rewinding a live session of old_pos tokens to rewind_to keeps
+ * less than half of it and the session is large enough to be cached. */
+static bool live_rewind_discards_session(int old_pos, int rewind_to,
+                                         int min_tokens) {
+    return old_pos >= min_tokens && rewind_to >= 0 && rewind_to < old_pos / 2;
+}
+
 static void trace_time(FILE *fp) {
     time_t now = time(NULL);
     struct tm tm;
@@ -15720,6 +15727,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_MEMORY_REWIND: {
+        /* A rewind that throws away most of the live session is an eviction
+         * in all but name, but the evict store runs only on a full miss, so
+         * a short prompt that is a prefix of a long conversation (a retry
+         * from an early turn) destroyed that conversation unsaved.  Persist
+         * it first.  Ordinary regenerations rewind only a short tail and
+         * keep the prefix live; storing the whole session for those would
+         * be churn, hence the half-session threshold. */
+        if (s->kv.enabled &&
+            live_rewind_discards_session(old_pos, reuse.reuse_tokens,
+                                         s->kv.opt.min_tokens)) {
+            kv_cache_store_current(s, slot, "evict", j->req.prompt_text);
+        }
         pthread_mutex_lock(&s->inference_mu);
         /* GLM-5.3 rewinds to a live-rewind snapshot when one sits exactly on
          * the target the probe named; every other engine uses the ordinary
@@ -26071,6 +26090,14 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 8, 7) == 6);
     TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 20, 17) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 3, 1) == -1);
+
+    /* A retry from an early turn discards most of a long session: persist
+     * it.  A regeneration that drops only the tail does not. */
+    TEST_ASSERT(live_rewind_discards_session(5738, 27, 512));
+    TEST_ASSERT(!live_rewind_discards_session(49826, 48378, 512));
+    TEST_ASSERT(!live_rewind_discards_session(400, 10, 512));
+    TEST_ASSERT(!live_rewind_discards_session(5738, -1, 512));
+    TEST_ASSERT(!live_rewind_discards_session(5738, 2869, 512));
 }
 
 static void test_client_socket_nonblocking_flag(void) {
