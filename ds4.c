@@ -42159,7 +42159,10 @@ static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_ten
  * are addressed by valid length, so the rows past `pos` are simply never read
  * again, and the odd-row pair state is rewritten by the next even token; the
  * decode windows are rebuilt from the rewind ring, which must still hold the
- * rows before `pos`. `tokens` is the session's full token history.
+ * rows before `pos`. `tokens` is the session's full token history; bit i of
+ * `image_tail` marks position pos-1-i as an image row, which the Engram
+ * history records as dead (as ds41_hash_tokens' text mask did), not as the
+ * placeholder token stored there.
  *
  * A ring slot is reused by the position raw_log_rows above it. Rows may have
  * been written past the current position: DSpark verification writes up to
@@ -42167,7 +42170,8 @@ static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_ten
  * rewind left the rows of the abandoned tail behind. raw_log_hi plus the
  * slack bounds every position written so far. */
 #define DS41_RAW_LOG_SLACK 8u
-static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos) {
+static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos,
+                              uint32_t image_tail) {
     if (!g->valid || pos > g->pos || (pos & 1u)) return false;
     if (pos < g->pos) {
         const uint32_t need = pos < 128u ? pos : 128u;
@@ -42196,7 +42200,8 @@ static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos
     g->pos = pos;
     ds4_engram_history_reset(&g->history);
     for (uint32_t i = 0; i < 3 && i < pos; i++)
-        g->history.tail[i] = (int32_t)g->token_map[tokens[pos - 1u - i]];
+        g->history.tail[i] = (image_tail >> i) & 1u ? DS4_ENGRAM_DEAD :
+            (int32_t)g->token_map[tokens[pos - 1u - i]];
     ds41_dspark_truncate(g->dspark, pos);
     return true;
 }
@@ -89384,6 +89389,39 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 #endif
 }
 
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+static bool ds4_session_image_at(const ds4_session *s, int pos) {
+    for (size_t i = 0; pos >= 0 && i < s->checkpoint_image_count; i++) {
+        const ds4_vision_identity *v = &s->checkpoint_images[i];
+        if ((uint32_t)pos < v->token_start) break;
+        if ((uint64_t)(uint32_t)pos - v->token_start < v->token_count) return true;
+    }
+    return false;
+}
+
+/* Bit i set: position pos-1-i is an image row (see ds41_graph_rewind). */
+static uint32_t ds41_session_image_tail(const ds4_session *s, int pos) {
+    uint32_t bits = 0;
+    for (int i = 0; i < 3 && i < pos; i++)
+        if (ds4_session_image_at(s, pos - 1 - i)) bits |= 1u << i;
+    return bits;
+}
+
+/* Forget images the rewind dropped entirely. A span that straddles `pos`
+ * stays: its rows before `pos` are in the state, and keeping its identity
+ * means only the same image can continue it (ds4_session_sync invalidates on
+ * any other). */
+static void ds41_session_drop_images_from(ds4_session *s, int pos) {
+    size_t n = s->checkpoint_image_count;
+    while (n && s->checkpoint_images[n - 1].token_start >= (uint32_t)pos) n--;
+    s->checkpoint_image_count = n;
+    if (!n) {
+        free(s->checkpoint_images);
+        s->checkpoint_images = NULL;
+    }
+}
+#endif
+
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
@@ -89393,9 +89431,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     /* ds41_graph_rewind only lands on even positions.  For an odd target,
      * rewind to the even position below and replay the one kept token: one
      * decode step, where invalidating would make the caller rebuild the whole
-     * prefix from token 0. */
+     * prefix from token 0.  The replay is a text decode, so the kept token
+     * must not be an image row (the session no longer holds its projection). */
     if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
-        s->ds41_graph_ready && s->checkpoint_image_count == 0) {
+        s->ds41_graph_ready && !ds4_session_image_at(s, pos - 1)) {
         const int keep = s->checkpoint.v[pos - 1];
         ds4_session_rewind(s, pos - 1);
         if (s->checkpoint_valid) {
@@ -89451,12 +89490,14 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    /* Text-only: the rebuilt Engram history (and an odd target's replayed
-     * token) would treat image positions as text. */
+    /* Image rows in the kept prefix are fine: their raw rows are in the ring
+     * like any other, and the rebuilt Engram history marks them dead. */
     if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
-        s->checkpoint_image_count == 0 &&
-        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
-        state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize()) {
+        state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos,
+                                     ds41_session_image_tail(s, pos));
+        if (state_ok) ds41_session_drop_images_from(s, pos);
+    }
 #endif
 #endif
     s->checkpoint.len = pos;

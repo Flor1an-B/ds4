@@ -13499,8 +13499,9 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &req->prompt);
     const bool token_image_prefix = ds4_session_vision_prefix_matches(
         slot->session, req->images, req->image_count);
-    /* V4.1 rewinds exactly but only text-only checkpoints (ds4.c); a
-     * (NULL, 0) vision match is false while the checkpoint holds images.
+    /* V4.1 rewinds exactly, images in the kept prefix included (ds4.c); like
+     * every live tier, its rewind tiers below also need token_image_prefix:
+     * the checkpoint's images must be a prefix of the request's.
      * GLM-5.3 cannot truncate its KDA recurrence, so it is excluded from this
      * blind tier entirely -- its only live rewind is the snapshot floor,
      * asked of the core further down, after every tier that needs no
@@ -13509,8 +13510,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * snapshot miss just resets the recurrent/speculative state and replays
      * the kept tokens on the next eval -- so it carries no failure mode to
      * exclude it for. */
-    const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine) &&
-        ds4_session_vision_prefix_matches(slot->session, NULL, 0);
+    const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine);
     const bool glm_truncate_here = ds4_engine_is_glm_dsa(s->engine) &&
         !ds4_engine_is_glm53(s->engine);
     const bool qwen4_rewind = ds4_engine_is_qwen4(s->engine);
@@ -15771,14 +15771,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * frontier: the common prefix must land exactly on the rewind target
          * and the vision state must still describe the request (upstream's
          * multimodal hardening).  A failed validation falls through to the
-         * disk cache / cold prefill instead of reusing a bad frontier. */
+         * disk cache / cold prefill instead of reusing a bad frontier.
+         * A V4.1 rewind below a diverged prompt keeps only the images before
+         * the target; the request may add more after it, so its kept images
+         * need only be a prefix of the request's. */
         const bool rewind_valid =
             ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                 reuse.reuse_tokens &&
             (!multimodal ||
-             ds4_session_vision_state_matches(slot->session,
-                                              j->req.images,
-                                              j->req.image_count));
+             (ds4_engine_is_deepseek41(s->engine) ?
+              ds4_session_vision_prefix_matches(slot->session,
+                                                j->req.images,
+                                                j->req.image_count) :
+              ds4_session_vision_state_matches(slot->session,
+                                               j->req.images,
+                                               j->req.image_count)));
         pthread_mutex_unlock(&s->inference_mu);
         if (rewind_valid) {
             live_materialized = true;
@@ -19198,6 +19205,38 @@ static void test_slot_probe_v41_rewind_tiers(void) {
         free(slot.live_text);
         ds4_session_free_test_checkpoint(slot.session);
         request_free(&j.req);
+    }
+    /* An image in the kept prefix: the diverged tier still rewinds when the
+     * request carries the same image at the same place, and declines when
+     * the image differs or the request adds one inside the live range. */
+    {
+        ds4_vision_span live_img = {.token_start = 2,
+            .embedding = {.token_count = 2, .fingerprint = {7}}};
+        struct { uint8_t fp; uint32_t extra_start; slot_reuse_kind kind; } icases[] = {
+            {7, 0, REUSE_MEMORY_REWIND},
+            {8, 0, REUSE_NONE},
+            {7, 8, REUSE_NONE},
+            {7, 12, REUSE_MEMORY_REWIND},
+        };
+        for (size_t c = 0; c < sizeof(icases) / sizeof(icases[0]); c++) {
+            server_slot slot = {0};
+            slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+            ds4_session_set_test_images(slot.session, &live_img, 1);
+            ds4_vision_span req_img[2] = {live_img,
+                {.token_start = icases[c].extra_start,
+                 .embedding = {.token_count = 1, .fingerprint = {9}}}};
+            req_img[0].embedding.fingerprint[0] = icases[c].fp;
+            request req = {0};
+            for (int i = 0; i < 6; i++) ds4_tokens_push(&req.prompt, i + 1);
+            for (int i = 0; i < 8; i++) ds4_tokens_push(&req.prompt, 900 + i);
+            req.images = req_img;
+            req.image_count = icases[c].extra_start ? 2 : 1;
+            slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &req);
+            TEST_ASSERT(pr.kind == icases[c].kind);
+            if (pr.kind == REUSE_MEMORY_REWIND) TEST_ASSERT(pr.reuse_tokens == 6);
+            ds4_tokens_free(&req.prompt);
+            ds4_session_free_test_checkpoint(slot.session);
+        }
     }
     ds4_test_use_deepseek41_shape(0);
 }
