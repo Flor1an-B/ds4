@@ -42750,8 +42750,30 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    /* DS4_V41_LAYER_TIMING: split one layer into before-MoE (attention +
+     * indexer projections), MoE (routed + shared experts), after-MoE.
+     * Averages over 16 tokens; diagnostic only. */
+    static __thread double lt_pre, lt_moe, lt_post;
+    static __thread uint32_t lt_n;
+    const bool lt = getenv("DS4_V41_LAYER_TIMING") != NULL;
+    const double t0 = lt ? now_sec() * 1000.0 : 0.0;
+    const bool ok = ds41_graph_before_moe(g, m, l, il);
+    if (lt) lt_pre += now_sec() * 1000.0 - t0;
+    const double t1 = lt ? now_sec() * 1000.0 : 0.0;
+    const bool ok2 = ok && ds41_moe(g, m, l, il, (uint32_t)token);
+    if (lt) lt_moe += now_sec() * 1000.0 - t1;
+    const double t2 = lt ? now_sec() * 1000.0 : 0.0;
+    const bool ok3 = ok2 && ds41_graph_after_moe(g);
+    if (lt) {
+        lt_post += now_sec() * 1000.0 - t2;
+        if (++lt_n % (16u * DS4_N_LAYER) == 0) {
+            const double inv = 16.0;
+            fprintf(stderr, "ds4: layer timing per token: pre=%.1fms moe=%.1fms post=%.1fms\n",
+                    lt_pre/inv, lt_moe/inv, lt_post/inv);
+            lt_pre = lt_moe = lt_post = 0.0;
+        }
+    }
+    return ok3;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42878,6 +42900,15 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    /* DS4_V41_STEP_TIMING: per-step wall breakdown (engram wait / gpu sync /
+     * submit / logits), aggregated and printed every 16 steps. Diagnostic
+     * only; off by default. */
+    static __thread double st_total, st_engram, st_sync, st_submit, st_logits;
+    static __thread uint32_t st_count;
+    const bool step_timing = getenv("DS4_V41_STEP_TIMING") != NULL;
+    const double st_t0 = step_timing ? now_sec() * 1000.0 : 0.0;
+    double st_engram_wait_end = 0.0, st_sync_start = 0.0;
+    double st_engram_acc = 0.0, st_sync_acc = 0.0;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     g->candidate_count = 0;
     g->candidate_pos = UINT32_MAX;
@@ -42932,8 +42963,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
+            const double st_ew0 = step_timing ? now_sec() * 1000.0 : 0.0;
             ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
                 ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            if (step_timing) st_engram_acc += now_sec() * 1000.0 - st_ew0;
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42946,11 +42979,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        if (step_timing) st_sync_start = now_sec() * 1000.0;
         if (drain) {
             if (!ds4_gpu_end_commands()) ok = false;
         } else if (queue_single && !ds4_gpu_flush_commands()) {
             ok = false;
         }
+        if (step_timing) st_sync_acc += now_sec() * 1000.0 - st_sync_start;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -42962,7 +42997,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+    const double st_lg0 = step_timing ? now_sec() * 1000.0 : 0.0;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (step_timing) {
+        const double now = now_sec() * 1000.0;
+        st_logits += now - st_lg0;
+        st_engram += st_engram_acc;
+        st_sync += st_sync_acc;
+        st_submit += (now - st_t0) - st_engram_acc - st_sync_acc - (now - st_lg0);
+        st_total += now - st_t0;
+        if (++st_count % 16 == 0) {
+            fprintf(stderr, "ds4: step timing n=%u total=%.1fms (submit=%.1f sync=%.1f engram=%.1f logits=%.1f)\n",
+                    st_count, st_total/st_count, st_submit/st_count, st_sync/st_count,
+                    st_engram/st_count, st_logits/st_count);
+        }
+    }
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
