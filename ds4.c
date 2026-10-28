@@ -3289,7 +3289,10 @@ static bool support_model_checkpoint_compatible(const ds4_model *m) {
     ds4_str family = {0}, arch = {0};
     const bool has_family = model_get_string(m, "dspark.target_architecture", &family);
     const bool has_arch = model_get_string(m, "general.architecture", &arch);
-    const bool v41 = has_family && ds4_streq(family, "deepseek41") &&
+    /* Newer V4.1 drafters carry only general.architecture =
+     * "deepseek41-dspark" without dspark.target_architecture; the arch string
+     * alone is unambiguous. */
+    const bool v41 = (!has_family || ds4_streq(family, "deepseek41")) &&
                      has_arch && ds4_streq(arch, "deepseek41-dspark");
     if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) != v41 ||
         (has_family && !v41 && !ds4_streq(family, "deepseek4")) ||
