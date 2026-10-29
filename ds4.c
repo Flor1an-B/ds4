@@ -42910,7 +42910,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     static __thread uint32_t st_count;
     const bool step_timing = getenv("DS4_V41_STEP_TIMING") != NULL;
     const double st_t0 = step_timing ? now_sec() * 1000.0 : 0.0;
-    double st_engram_wait_end = 0.0, st_sync_start = 0.0;
+    double st_sync_start = 0.0;
     double st_engram_acc = 0.0, st_sync_acc = 0.0;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     g->candidate_count = 0;
